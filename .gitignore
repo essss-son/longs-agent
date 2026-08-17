@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Runtime data: sessions / skills / traces (per-user, never tracked)
+.agent/sessions/
+.agent/skills/
+
+# Local config: keep example tracked, ignore real (may hold base_url)
+.agent/config.toml
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Internal planning doc (not for remote)
+longs-agent项目说明.md
