@@ -17,6 +17,11 @@ dev = [
 mcp = [
     "mcp>=1.0",
 ]
+tui = [
+    "rich>=13.0",
+    "pyfiglet>=1.0",
+    "wcwidth>=0.2",
+]
 
 [project.scripts]
 agent = "agent.__main__:main"
