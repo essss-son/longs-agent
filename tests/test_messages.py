@@ -61,7 +61,10 @@ def test_as_text():
     assert as_text(None) == ""
     assert as_text("hi") == "hi"
     assert as_text([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]) == "ab"
-    assert as_text([{"type": "other"}, {"text": "c"}]) == "c"
+    # 非 text 类型块不提取（Anthropic 语义：只有 text block 是正文）
+    assert as_text([{"type": "other", "text": "c"}]) == ""
+    # text 为空的块跳过
+    assert as_text([{"type": "text", "text": ""}, {"type": "text", "text": "d"}]) == "d"
 
 
 def test_four_roles_to_dict_json_serializable():

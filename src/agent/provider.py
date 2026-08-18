@@ -164,8 +164,62 @@ class OpenAICompatibleProvider:
         on_delta: Callable[[str], None] | None = None,
         **kw,
     ) -> NormalizedResponse:
-        """D3 实现：流式渲染 delta.content + 按 index 累积 tool_calls 片段。"""
-        raise NotImplementedError("stream 在 D3 实现")
+        """流式：实时渲染 delta.content，按 index 累积 tool_calls 片段，流结束重建。
+
+        隐藏坑：首 chunk 常只有 delta.role 无 content；末 chunk 才有 finish_reason；
+        arguments 跨多 chunk 按 index 累积；tool_call.id 只在首个含该 index 的 chunk。
+        """
+        openai_msgs = to_openai_messages(messages, system)
+        kwargs: dict[str, Any] = {"model": self._model, "messages": openai_msgs, "stream": True}
+        if tools:
+            kwargs["tools"] = tools
+        stream = await self._client.chat.completions.create(**kwargs)
+
+        content_parts: list[str] = []
+        tool_frags: dict[int, dict] = {}  # index → {id, name, args_parts}
+        finish_reason = None
+        model = None
+        async for chunk in stream:
+            data = chunk.model_dump() if hasattr(chunk, "model_dump") else chunk
+            if not model:
+                model = data.get("model")
+            choices = data.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta", {})
+            if delta.get("content"):
+                content_parts.append(delta["content"])
+                if on_delta:
+                    on_delta(delta["content"])
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                frag = tool_frags.setdefault(idx, {"id": None, "name": None, "args": []})
+                if tc.get("id"):
+                    frag["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    frag["name"] = fn["name"]
+                if fn.get("arguments"):
+                    frag["args"].append(fn["arguments"])
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
+
+        content = "".join(content_parts) if content_parts else None
+        tool_calls = None
+        if tool_frags:
+            tool_calls = []
+            for idx in sorted(tool_frags):
+                frag = tool_frags[idx]
+                args_str = "".join(frag["args"])
+                try:
+                    args = json.loads(args_str) if args_str else {}
+                except json.JSONDecodeError:
+                    args = {"_raw": args_str}
+                tool_calls.append(ToolCall(id=frag["id"] or "", name=frag["name"] or "", arguments=args))
+        return NormalizedResponse(
+            content=content, tool_calls=tool_calls, finish_reason=finish_reason, model=model
+        )
 
 
 class ScriptExhaustedError(Exception):
