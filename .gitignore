@@ -22,3 +22,17 @@ venv/
 
 # Internal planning doc (not for remote)
 longs-agent项目说明.md
+
+# Claude Code local config
+.claude/
+
+# All markdown docs (internal, not for remote)
+*.md
+
+# SWE-bench evaluation (code, logs, results) — not for remote
+.agent/swebench*
+.agent/run_all.log
+agent_quiz/
+eval_report.json
+logs/
+new_test.py
