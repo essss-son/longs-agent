@@ -23,8 +23,16 @@ class ModelConfig:
 
 
 @dataclass
+class McpServerConfig:
+    name: str
+    command: str
+    args: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Config:
     models: dict[str, ModelConfig] = field(default_factory=dict)
+    mcp_servers: dict[str, McpServerConfig] = field(default_factory=dict)
     default_alias: str = ""
 
     def get(self, alias: str | None = None) -> ModelConfig | None:
@@ -47,8 +55,19 @@ class Config:
         with open(p, "rb") as f:
             data = tomllib.load(f)
         models: dict[str, ModelConfig] = {}
+        mcp_servers: dict[str, McpServerConfig] = {}
         default_alias = ""
         for table_name, tbl in data.items():
+            # mcp server 段：[mcp.<name>] 解析成嵌套 data["mcp"]["<name>"]
+            if table_name == "mcp" and isinstance(tbl, dict):
+                for mname, sub in tbl.items():
+                    if isinstance(sub, dict):
+                        mcp_servers[mname] = McpServerConfig(
+                            name=mname,
+                            command=sub.get("command", ""),
+                            args=list(sub.get("args", [])),
+                        )
+                continue
             alias = tbl.get("alias", table_name)
             models[alias] = ModelConfig(
                 alias=alias,
@@ -60,4 +79,4 @@ class Config:
             )
             if not default_alias:
                 default_alias = alias
-        return cls(models=models, default_alias=default_alias)
+        return cls(models=models, mcp_servers=mcp_servers, default_alias=default_alias)
