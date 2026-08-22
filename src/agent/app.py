@@ -4,15 +4,17 @@ D9：装配 Compactor（provider + context_window）。
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime
 
+from .archive import ArchiveStore, MemoryRead, MemorySearch
 from .builtin_tools import Bash, Edit, Glob, Grep, Read, Write
 from .compaction import Compactor
 from .config import Config
 from .loop import AgentLoop
 from .messages import NormalizedResponse, ToolCall
 from .permissions import Mode, PermissionConfig, PermissionEngine
-from .plan_mode import ExitPlanMode
+from .plan_mode import EnterPlanMode, ExitPlanMode
 from .provider import FakeProvider, OpenAICompatibleProvider
 from .repl import REPL
 from .session import SessionStore
@@ -28,6 +30,7 @@ def _build_registry() -> ToolRegistry:
     r.register(Bash())
     r.register(Glob())
     r.register(Grep())
+    r.register(EnterPlanMode())
     r.register(ExitPlanMode())
     return r
 
@@ -43,6 +46,22 @@ def _demo_script() -> list:
             content="（demo）我读取了项目说明。配置 .agent/config.toml 后可用真实模型自由对话。"
         ),
     ]
+
+
+async def _load_mcp_tools(cfg, registry) -> None:
+    """加载 config 里的 MCP servers，注册工具到 registry。失败不中断主流程。"""
+    for name, mcp_cfg in cfg.mcp_servers.items():
+        try:
+            from .mcp_client import load_mcp_server
+
+            tools = await load_mcp_server(name, mcp_cfg.command, mcp_cfg.args)
+            for t in tools:
+                registry.register(t)
+            print(f"[longs-agent] MCP server '{name}' 加载 {len(tools)} 个工具")
+        except ImportError:
+            print(f"[longs-agent] MCP 未安装，跳过 server '{name}'（pip install -e \".[mcp]\"）")
+        except Exception as e:
+            print(f"[longs-agent] MCP server '{name}' 加载失败: {type(e).__name__}: {e}")
 
 
 async def main() -> None:
@@ -63,19 +82,24 @@ async def main() -> None:
         print("[longs-agent] 未配置 .agent/config.toml 或缺少 api_key，用 demo 模式。")
 
     session = SessionStore()
+    archive = ArchiveStore(session.dir)  # L2 档案层：压缩换出的内容归档，MemoryRead 可取回
     session.write_meta(
         {
             "sid": session.sid,
             "model_alias": model.alias if model else "demo",
             "created_at": datetime.now().isoformat(),
-            "mode": "NORMAL",
+            "mode": "MANUAL",
         }
     )
     registry = _build_registry()
+    # 加载 MCP 工具（注册进同一 registry → 自动复用权限/trace/plan）
+    await _load_mcp_tools(cfg, registry)
     todo_store = TodoStore(path=session.todo_path)
     registry.register(TodoWrite(todo_store))
+    registry.register(MemoryRead(archive))
+    registry.register(MemorySearch(archive))
     context_window = model.context_window if model else 32768
-    compactor = Compactor(provider, context_window=context_window)
+    compactor = Compactor(provider, context_window=context_window, archive=archive)
     from .memory import build_system_prompt, load_agent_md
     from .skills import scan_skills, skills_prompt_block
 
@@ -91,8 +115,8 @@ async def main() -> None:
         registry,
         session,
         permissions=PermissionEngine(),
-        permission_config=PermissionConfig(),
-        mode=Mode.NORMAL,
+        permission_config=PermissionConfig(project_root=os.getcwd()),
+        mode=Mode.MANUAL,
         todo_store=todo_store,
         compactor=compactor,
         system_prompt=system_prompt,
