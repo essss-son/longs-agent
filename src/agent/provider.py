@@ -162,27 +162,35 @@ class OpenAICompatibleProvider:
         tools: list[dict] | None = None,
         system: str | None = None,
         on_delta: Callable[[str], None] | None = None,
+        on_reasoning: Callable[[str], None] | None = None,
         **kw,
     ) -> NormalizedResponse:
         """流式：实时渲染 delta.content，按 index 累积 tool_calls 片段，流结束重建。
 
         隐藏坑：首 chunk 常只有 delta.role 无 content；末 chunk 才有 finish_reason；
         arguments 跨多 chunk 按 index 累积；tool_call.id 只在首个含该 index 的 chunk。
+        on_reasoning：解析 delta.reasoning_content（DeepSeek-R1 / glm 思考模型等），
+        模型不返回则不触发，兼容无害。
         """
         openai_msgs = to_openai_messages(messages, system)
         kwargs: dict[str, Any] = {"model": self._model, "messages": openai_msgs, "stream": True}
         if tools:
             kwargs["tools"] = tools
+        # 要求流式末尾回传 usage（OpenAI 需显式开启；兼容 provider 忽略此参数）
+        kwargs["stream_options"] = {"include_usage": True}
         stream = await self._client.chat.completions.create(**kwargs)
 
         content_parts: list[str] = []
         tool_frags: dict[int, dict] = {}  # index → {id, name, args_parts}
         finish_reason = None
         model = None
+        usage_data: dict | None = None
         async for chunk in stream:
             data = chunk.model_dump() if hasattr(chunk, "model_dump") else chunk
             if not model:
                 model = data.get("model")
+            if data.get("usage"):
+                usage_data = data["usage"]  # 流式 usage 只在最后一个 chunk 顶层
             choices = data.get("choices") or []
             if not choices:
                 continue
@@ -192,6 +200,9 @@ class OpenAICompatibleProvider:
                 content_parts.append(delta["content"])
                 if on_delta:
                     on_delta(delta["content"])
+            rc = delta.get("reasoning_content")
+            if rc and on_reasoning:
+                on_reasoning(rc)
             for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)
                 frag = tool_frags.setdefault(idx, {"id": None, "name": None, "args": []})
@@ -217,8 +228,14 @@ class OpenAICompatibleProvider:
                 except json.JSONDecodeError:
                     args = {"_raw": args_str}
                 tool_calls.append(ToolCall(id=frag["id"] or "", name=frag["name"] or "", arguments=args))
+        usage = Usage(
+            prompt_tokens=usage_data.get("prompt_tokens", 0),
+            completion_tokens=usage_data.get("completion_tokens", 0),
+            total_tokens=usage_data.get("total_tokens", 0),
+        ) if usage_data else Usage()
         return NormalizedResponse(
-            content=content, tool_calls=tool_calls, finish_reason=finish_reason, model=model
+            content=content, tool_calls=tool_calls, finish_reason=finish_reason,
+            model=model, usage=usage,
         )
 
 
