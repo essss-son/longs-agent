@@ -20,7 +20,7 @@ def new_session_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
-def _read_jsonl_tolerant(path: Path) -> list[dict]:
+def read_jsonl_tolerant(path: Path) -> list[dict]:
     """容错读 JSONL：末行无换行符（半截，Ctrl+C 中断 write）静默跳过；中间坏行跳过。"""
     out: list[dict] = []
     if not path.exists():
@@ -69,7 +69,7 @@ class SessionStore:
             f.flush()
 
     def read_messages(self) -> list[Message]:
-        return [Message.from_dict(d) for d in _read_jsonl_tolerant(self.messages_path)]
+        return [Message.from_dict(d) for d in read_jsonl_tolerant(self.messages_path)]
 
     def append_trace(self, event: dict) -> None:
         """写 trace.jsonl 一行。自动加 seq + ts。"""
@@ -81,7 +81,7 @@ class SessionStore:
             f.flush()
 
     def read_trace(self) -> list[dict]:
-        return _read_jsonl_tolerant(self.trace_path)
+        return read_jsonl_tolerant(self.trace_path)
 
     def write_meta(self, meta: dict) -> None:
         """原子写 meta.json：写 .tmp → os.replace。防 Ctrl+C 腐蚀整个 meta。"""
