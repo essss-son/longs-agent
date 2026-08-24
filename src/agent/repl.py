@@ -51,3 +51,66 @@ class REPL:
         mode_name = getattr(self.loop, "mode", None)
         mode_str = mode_name.name if mode_name else self.mode
         return f" mode={mode_str} | session={self.loop.session.sid} | /exit /help /plan /mode /resume /compact "
+
+    async def _slash(self, cmd: str) -> str | None:
+        cmd_lower = cmd.lower()
+        if cmd_lower in ("/exit", "/quit"):
+            return "exit"
+        if cmd_lower == "/help":
+            print(
+                "命令: /exit /help /plan /mode /resume [sid] /compact /context /cost\n"
+                "（后续: /model /trace /skill）"
+            )
+            return None
+        if cmd_lower == "/plan":
+            self.loop._enter_plan()
+            print("[plan mode] 只读探索，ExitPlanMode 提交计划供审批")
+            return None
+        if cmd_lower == "/mode":
+            if self.loop.mode == Mode.PLAN:
+                print("[plan mode] 用 ExitPlanMode 提交计划退出，或继续探索")
+            elif self.loop.mode == Mode.MANUAL:
+                self.loop.mode = Mode.AUTO
+            else:
+                self.loop.mode = Mode.MANUAL
+            print(f"[mode] {self.loop.mode.name}（hard deny 仍生效）")
+            return None
+        if cmd_lower.startswith("/resume"):
+            await self._resume(cmd)
+            return None
+        if cmd_lower == "/compact":
+            await self._compact()
+            return None
+        if cmd_lower == "/context":
+            self._show_context()
+            return None
+        if cmd_lower == "/cost":
+            self._show_cost()
+            return None
+        if cmd_lower == "/trace":
+            print(self._trace_view())
+            return None
+        if cmd_lower.startswith("/model"):
+            await self._switch_model(cmd)
+            return None
+        print(f"未知命令: {cmd}（/help 查看）")
+        return None
+
+    async def _compact(self) -> None:
+        if not self.loop.compactor:
+            print("无 compactor")
+            return
+        before = len(self.loop.messages)
+        self.loop.messages = await self.loop.compactor.compact(
+            self.loop.messages, self.loop._active_tools()
+        )
+        print(f"[compacted] {before} → {len(self.loop.messages)} 条消息")
+
+    def _show_context(self) -> None:
+        from .utils import estimate_messages_tokens
+
+        tools = self.loop._active_tools()
+        used = estimate_messages_tokens(self.loop.messages, tools)
+        win = getattr(self.loop.provider, "context_window", 32768)
+        pct = 100 * used // max(win, 1)
+        print(f"token: {used}/{win} ({pct}%)，{len(self.loop.messages)} 条消息")
