@@ -176,3 +176,67 @@ class REPL:
         from .trace import TraceStore
 
         return TraceStore(self.loop.session.trace_path).timeline_view()
+
+    async def _switch_model(self, cmd: str) -> None:
+        """热切换供应商：换 loop.provider（归一化历史可重序列化）。"""
+        from .config import Config
+        from .provider import OpenAICompatibleProvider
+
+        parts = cmd.split(maxsplit=1)
+        alias = parts[1].strip() if len(parts) > 1 else None
+        if not alias:
+            print("usage: /model <alias>")
+            return
+        cfg = Config.load()
+        m = cfg.get(alias)
+        key = cfg.api_key(alias)
+        if not m or not key:
+            print(f"unknown model or missing api_key: {alias}")
+            return
+        new_provider = OpenAICompatibleProvider(
+            base_url=m.base_url, api_key=key, model=m.model, context_window=m.context_window
+        )
+        self.loop.provider = new_provider
+        if self.loop.compactor:
+            self.loop.compactor.provider = new_provider
+        print(f"[model] switched to {m.model} @ {m.base_url}")
+
+    async def ask_permission(self, tool_call) -> str:
+        from .utils import render_diff
+
+        print(f"\n[ask permission] {tool_call.name}")
+        if tool_call.name == "Bash":
+            print(f"  command: {tool_call.arguments.get('command', '')}")
+        elif tool_call.name in ("Write", "Edit"):
+            fp = tool_call.arguments.get("file_path", "")
+            print(f"  file: {fp}")
+            try:
+                old = Path(fp).read_text(encoding="utf-8")
+            except Exception:
+                old = ""
+            if tool_call.name == "Write":
+                new = tool_call.arguments.get("content", "")
+                diff = render_diff(old, new)
+                print(f"  diff:\n{diff[:2000]}")
+            else:
+                print(f"  old_string: {tool_call.arguments.get('old_string', '')[:200]}")
+                print(f"  new_string: {tool_call.arguments.get('new_string', '')[:200]}")
+        else:
+            print(f"  args: {tool_call.arguments}")
+        try:
+            ans = await self._session.prompt_async("(y/n/always): ")
+        except (EOFError, KeyboardInterrupt):
+            return "n"
+        ans = ans.strip().lower()
+        if ans == "always":
+            return "always"
+        return "y" if ans == "y" else "n"
+
+    async def approve_plan(self, plan: str) -> bool:
+        print("\n[plan for approval]")
+        print(plan[:3000])
+        try:
+            ans = await self._session.prompt_async("(a)ccept / (r)eject: ")
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return ans.strip().lower() == "a"
