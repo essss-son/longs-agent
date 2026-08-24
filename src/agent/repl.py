@@ -114,3 +114,65 @@ class REPL:
         win = getattr(self.loop.provider, "context_window", 32768)
         pct = 100 * used // max(win, 1)
         print(f"token: {used}/{win} ({pct}%)，{len(self.loop.messages)} 条消息")
+
+    async def _resume(self, cmd: str) -> None:
+        parts = cmd.split(maxsplit=1)
+        sid = parts[1].strip() if len(parts) > 1 else None
+        if sid:
+            self._load_session(sid)
+            return
+        sids = SessionStore.list_sessions()
+        if not sids:
+            print("无历史会话")
+            return
+        print("历史会话（最近修改在前）：")
+        for i, s in enumerate(sids[:5]):
+            print(f"  {i + 1}. {s}")
+        try:
+            choice = await self._session.prompt_async("选择恢复 (1-5，回车取消): ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        choice = choice.strip()
+        if choice.isdigit() and 1 <= int(choice) <= min(5, len(sids)):
+            self._load_session(sids[int(choice) - 1])
+        else:
+            print("已取消")
+
+    def _load_session(self, sid: str) -> None:
+        new_session = SessionStore(sid=sid)
+        msgs = new_session.read_messages()
+        if not msgs:
+            print(f"会话 {sid} 无消息或不存在")
+            return
+        self.loop.session = new_session
+        self.loop.messages = msgs
+        print(f"resume 会话 {sid}，恢复 {len(msgs)} 条消息")
+        self._render_todos()
+
+    def _render_todos(self) -> None:
+        todos = self.loop.session.read_todos()
+        if not todos:
+            return
+        print("\n[todos]")
+        marks = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]"}
+        for i, t in enumerate(todos):
+            status = t.get("status", "pending")
+            mark = marks.get(status, "[ ]")
+            label = t.get("active_form") or t.get("content", "")
+            print(f"  {i + 1}. {mark} {label}")
+        print()
+
+    def _show_cost(self) -> None:
+        from .trace import TraceStore
+
+        cost = TraceStore(self.loop.session.trace_path).cost()
+        print(
+            f"cost: prompt={cost['prompt_tokens']} completion={cost['completion_tokens']} "
+            f"total={cost['total_tokens']}"
+        )
+
+    def _trace_view(self) -> str:
+        from .trace import TraceStore
+
+        return TraceStore(self.loop.session.trace_path).timeline_view()
