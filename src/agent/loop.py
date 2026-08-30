@@ -5,6 +5,10 @@ plan 双重安全（D7）+ trace（D5）保持。
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
+
+from .envelope import wrap as wrap_tool_result
 from .messages import Message, ToolCall
 from .permissions import Mode, PermissionConfig, PermissionEngine, Verdict
 from .tools import ToolRegistry
@@ -30,8 +34,8 @@ class AgentLoop:
         todo_store=None,
         compactor=None,
         system_prompt: str | None = None,
-        max_steps: int = 50,
-        loop_detection_threshold: int = 5,
+        max_steps: int = 20,
+        loop_detection_threshold: int = 3,
     ):
         self.provider = provider
         self.registry = registry
@@ -49,6 +53,9 @@ class AgentLoop:
         self._mode_before_plan: Mode | None = None  # 进入 plan 前的模式，批准后据此恢复
         self._last_tool_sig: str | None = None  # 上一轮 tool_calls 签名（循环检测）
         self._repeat_count = 0  # 连续相同签名次数
+        self._last_assistant_index = 0  # 最近一次 assistant 消息在 messages 的索引（checkpoint 回滚边界）
+        self._current_user_index = 0  # 当前轮 user 消息在 messages 的索引（rewind 按用户消息粒度）
+        self._file_hashes: dict[str, str] = session.read_file_hashes()  # 乐观锁：Read 后记录的文件 hash，持久化（resume 恢复）
 
     def _active_tools(self) -> list[dict]:
         if self.mode == Mode.PLAN:
@@ -66,6 +73,15 @@ class AgentLoop:
             }
             for t in active
         ]
+
+    def _concurrent_safe(self, tc: ToolCall) -> bool:
+        """是否可并发执行：普通只读工具（无副作用、默认 auto-allow 不弹 ASK）。
+
+        写工具（Write/Edit/Bash）有副作用顺序 + diff 快照时机，必须串行；
+        EnterPlanMode/ExitPlanMode 改 mode 状态，必须串行。
+        """
+        tool = self.registry.get(tc.name)
+        return tool is not None and tool.read_only and tc.name != "ExitPlanMode"
 
     def _current_system_prompt(self) -> str | None:
         """每轮请求前刷新：基础 system_prompt + 当前 todos 段。"""
@@ -115,6 +131,7 @@ class AgentLoop:
         user_msg = Message("user", user_input)
         self.messages.append(user_msg)
         self.session.append_message(user_msg)
+        self._current_user_index = len(self.messages) - 1  # 当前轮 user 消息索引
         self.session.append_trace({"type": "turn_start", "data": {"user_input": user_input[:200]}})
 
         step_count = 0
@@ -135,7 +152,13 @@ class AgentLoop:
             if self.compactor and self.compactor.should_compact(self.messages, tools):
                 self.messages = await self.compactor.compact(self.messages, tools)
                 self.session.append_trace(
-                    {"type": "compaction", "data": {"remaining": len(self.messages)}}
+                    {
+                        "type": "compaction",
+                        "data": {
+                            "remaining": len(self.messages),
+                            "usage": self.compactor.consume_summary_usage(),
+                        },
+                    }
                 )
 
             # 每轮刷新 system_prompt 的 todos 段（TodoWrite 可能改了 todos）
@@ -152,6 +175,7 @@ class AgentLoop:
             assistant_msg = Message("assistant", resp.content, tool_calls=resp.tool_calls)
             self.messages.append(assistant_msg)
             self.session.append_message(assistant_msg)
+            self._last_assistant_index = len(self.messages) - 1  # checkpoint 回滚边界
             self.session.append_trace(
                 {
                     "type": "llm_response",
@@ -190,7 +214,24 @@ class AgentLoop:
                 self._repeat_count = 1
                 self._last_tool_sig = sig
 
-            for tc in resp.tool_calls:
+            # 分组：只读工具可安全并发（无副作用、无 ASK 弹窗）；写工具/特殊工具串行
+            safe = [tc for tc in resp.tool_calls if self._concurrent_safe(tc)]
+            serial = [tc for tc in resp.tool_calls if not self._concurrent_safe(tc)]
+
+            # 只读工具并发执行：gather 按入参顺序返回 → 消息顺序不乱，配对不破
+            if safe:
+                if on_event is not None:
+                    for tc in safe:
+                        on_event("tool_start", tc.name, tc.arguments)
+                msgs = await asyncio.gather(*(self.dispatch(tc) for tc in safe))
+                for tc, tool_msg in zip(safe, msgs):
+                    if on_event is not None:
+                        on_event("tool_end", tc.name, tool_msg.content or "")
+                    self.messages.append(tool_msg)
+                    self.session.append_message(tool_msg)
+
+            # 写工具/特殊工具串行（保持副作用顺序 + ASK 弹窗安全）
+            for tc in serial:
                 if on_event is not None:
                     on_event("tool_start", tc.name, tc.arguments)
                 # Write/Edit：执行前快照旧内容，执行后生成 diff
@@ -327,6 +368,39 @@ class AgentLoop:
                     {"type": "permission", "data": {"verdict": "ALLOW", "reason": "user"}}
                 )
 
+        # 写工具（Write/Edit）：乐观锁校验——文件自上次 Read 后被外部改动则拒绝
+        if tc.name in ("Write", "Edit"):
+            fp = tc.arguments.get("file_path", "")
+            if fp in self._file_hashes:
+                try:
+                    current = self._file_sha(fp)
+                except FileNotFoundError:
+                    current = None  # 文件被删：视为已变化
+                if current != self._file_hashes[fp]:
+                    self.session.append_trace(
+                        {
+                            "type": "permission",
+                            "data": {"verdict": "DENY", "reason": "file changed since last read"},
+                        }
+                    )
+                    return Message(
+                        "tool",
+                        content="[error: file changed since last read, please re-Read the file]",
+                        tool_call_id=tc.id,
+                        name=tc.name,
+                    )
+
+        # 写工具（Write/Edit）：执行前落盘快照（checkpoint，seq 对齐三时间线）
+        if tc.name in ("Write", "Edit"):
+            fp = tc.arguments.get("file_path", "")
+            seq = self.session.append_trace(
+                {"type": "file_snapshot", "data": {"file": fp}}
+            )
+            self.session.save_file_snapshot(
+                seq, fp, self._last_assistant_index, self._current_user_index
+            )
+            self.session.save_todo_snapshot(seq)
+
         # 执行
         self.session.append_trace(
             {"type": "tool_call", "data": {"name": tc.name, "arguments": tc.arguments}}
@@ -340,10 +414,33 @@ class AgentLoop:
             )
         if not isinstance(result, str):
             result = str(result)
+        # 乐观锁：Read 成功后记录文件 hash；Write/Edit 成功后更新为新内容 hash
+        if tc.name in ("Read", "Write", "Edit") and not result.startswith("[error"):
+            self._record_file_hash(tc.arguments.get("file_path", ""))
+        # 统一信封：超阈值 → 截断 + 落盘 tool-output/ + 返回指针
+        result = wrap_tool_result(
+            result,
+            tool_name=tc.name,
+            direction=tc.arguments.get("truncation", "head"),
+        )
         self.session.append_trace(
             {"type": "tool_result", "data": {"content_preview": result[:200]}}
         )
         return Message("tool", content=result, tool_call_id=tc.id, name=tc.name)
+
+    @staticmethod
+    def _file_sha(file_path: str) -> str:
+        """读文件内容算 sha256（乐观锁版本号）。文件不存在抛 FileNotFoundError。"""
+        with open(file_path, "r", encoding="utf-8") as f:
+            return hashlib.sha256(f.read().encode("utf-8")).hexdigest()
+
+    def _record_file_hash(self, file_path: str) -> None:
+        """Read/Write/Edit 成功后记录文件 hash 并持久化（乐观锁）。"""
+        try:
+            self._file_hashes[file_path] = self._file_sha(file_path)
+        except FileNotFoundError:
+            self._file_hashes.pop(file_path, None)
+        self.session.save_file_hashes(self._file_hashes)
 
     @staticmethod
     def _snapshot(tc):
