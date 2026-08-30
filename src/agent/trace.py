@@ -58,10 +58,10 @@ class TraceStore:
         return "\n".join(lines)
 
     def cost(self) -> dict:
-        """累计 prompt/completion/total tokens（从 llm_response 事件）。"""
+        """累计 prompt/completion/total tokens（llm_response + compaction 摘要请求）。"""
         prompt = completion = total = 0
         for e in self.all():
-            if e.get("type") == "llm_response":
+            if e.get("type") in ("llm_response", "compaction"):
                 usage = e.get("data", {}).get("usage", {})
                 prompt += usage.get("prompt_tokens", 0)
                 completion += usage.get("completion_tokens", 0)
