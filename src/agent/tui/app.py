@@ -442,7 +442,7 @@ class TUIApp:
                 self._app.exit()
             return
         if c == "/help":
-            self._append_raw("\n命令: /exit /help /plan /mode /model /resume /compact /context /cost /trace /thought /rename\n\n")
+            self._append_raw("\n命令: /exit /help /plan /mode /model /resume /compact /context /cost /trace /thought /rename /undo /rewind [n]\n\n")
             return
         if c == "/plan":
             self.loop._enter_plan()
@@ -480,6 +480,12 @@ class TUIApp:
 
             self._append_raw("\n" + TraceStore(self.loop.session.trace_path).timeline_view() + "\n")
             return
+        if c == "/undo":
+            self._undo()
+            return
+        if c.startswith("/rewind"):
+            await self._rewind(cmd)
+            return
         if c == "/thought":
             if not getattr(self, "_thoughts", []):
                 self._append_raw("\n(无思考记录)\n")
@@ -499,8 +505,7 @@ class TUIApp:
                 if sids:
                     lines = []
                     for s in sids:
-                        meta = SessionStore(sid=s).read_meta()
-                        name = meta.get("name", "")
+                        name = SessionStore(sid=s).get_name()
                         lines.append(f"  {s}  {name}" if name else f"  {s}")
                     self._append_raw("\n历史会话:\n" + "\n".join(lines) + "\n（用 /resume <sid> 恢复）\n")
                 else:
@@ -512,9 +517,7 @@ class TUIApp:
                 self._append_raw("\nusage: /rename <名字>\n")
                 return
             name = parts[1].strip()
-            meta = self.loop.session.read_meta()
-            meta["name"] = name
-            self.loop.session.write_meta(meta)
+            self.loop.session.set_name(name)
             self._append_raw(f"\n[rename] 会话 {self.loop.session.sid} 命名为: {name}\n")
             self._invalidate()
             return
@@ -555,8 +558,50 @@ class TUIApp:
             return
         self.loop.session = new_session
         self.loop.messages = msgs
-        name = new_session.read_meta().get("name", "")
+        name = new_session.get_name()
         self._append_raw(f"\n[resume] {sid} {name}，恢复 {len(msgs)} 条消息\n")
+        self._invalidate()
+
+    # ---- 回滚（/undo /rewind）----
+    def _undo(self) -> None:
+        """回滚最近一次 Write/Edit（三线：文件 + todo + messages）。"""
+        msg = self.loop.session.undo_last_write()
+        self._sync_after_rollback()
+        self._append_raw(f"\n{msg}\n", flush=True)
+
+    async def _rewind(self, cmd: str) -> None:
+        """回退到某条用户消息处理完成后的状态（用户消息粒度）。
+
+        TUI 无 prompt_toolkit 二次输入，交互式选择改由 /rewind <n> 带编号完成；
+        不带参数只列候选列表。
+        """
+        parts = cmd.split(maxsplit=1)
+        targets = self.loop.session.list_rewind_targets()
+        if not targets:
+            self._append_raw("\n(没有可回退的用户消息)\n", flush=True)
+            return
+        if len(parts) >= 2 and parts[1].strip().isdigit():
+            n = int(parts[1].strip())
+            if not (1 <= n <= len(targets)):
+                self._append_raw(f"\n(编号需在 1~{len(targets)} 之间)\n", flush=True)
+                return
+            self._do_rewind(targets[n - 1], n)
+            return
+        lines = ["可回退到的用户消息（用 /rewind <n> 选择）："]
+        for i, t in enumerate(targets, 1):
+            lines.append(f"  {i}. {t['preview']}")
+        self._append_raw("\n" + "\n".join(lines) + "\n", flush=True)
+
+    def _do_rewind(self, target: dict, n: int) -> None:
+        msg = self.loop.session.rewind_to_user(target["idx"])
+        self._sync_after_rollback()
+        self._append_raw(f"\n[rewind] 回到第 {n} 条消息：{msg}\n", flush=True)
+
+    def _sync_after_rollback(self) -> None:
+        """回滚后同步内存态：loop.messages 重读、todo_store 重载。"""
+        self.loop.messages = self.loop.session.read_messages()
+        if self.loop.todo_store is not None:
+            self.loop.todo_store.load()
         self._invalidate()
 
     # ---- 工具方法 ----
@@ -582,8 +627,7 @@ class TUIApp:
         return self._min_width
 
     def _session_name(self) -> str:
-        meta = self.loop.session.read_meta()
-        return meta.get("name", "") or ""
+        return self.loop.session.get_name()
 
     def _input_box_ft(self):
         width = self._term_width()

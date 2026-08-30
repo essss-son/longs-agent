@@ -58,8 +58,8 @@ class REPL:
             return "exit"
         if cmd_lower == "/help":
             print(
-                "命令: /exit /help /plan /mode /resume [sid] /compact /context /cost\n"
-                "（后续: /model /trace /skill）"
+                "命令: /exit /help /plan /mode /resume [sid] /compact /context /cost /rename <名字>\n"
+                "（后续: /model /trace /skill /undo /rewind [n]）"
             )
             return None
         if cmd_lower == "/plan":
@@ -89,6 +89,19 @@ class REPL:
             return None
         if cmd_lower == "/trace":
             print(self._trace_view())
+            return None
+        if cmd_lower == "/undo":
+            self._undo()
+            return None
+        if cmd_lower.startswith("/rewind"):
+            await self._rewind(cmd)
+            return None
+        if cmd_lower.startswith("/rename"):
+            parts = cmd.split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].strip():
+                print("usage: /rename <名字>")
+                return None
+            self._rename(parts[1].strip())
             return None
         if cmd_lower.startswith("/model"):
             await self._switch_model(cmd)
@@ -127,7 +140,8 @@ class REPL:
             return
         print("历史会话（最近修改在前）：")
         for i, s in enumerate(sids[:5]):
-            print(f"  {i + 1}. {s}")
+            name = SessionStore(sid=s).get_name()
+            print(f"  {i + 1}. {s}  {name}" if name else f"  {i + 1}. {s}")
         try:
             choice = await self._session.prompt_async("选择恢复 (1-5，回车取消): ")
         except (EOFError, KeyboardInterrupt):
@@ -147,7 +161,10 @@ class REPL:
             return
         self.loop.session = new_session
         self.loop.messages = msgs
-        print(f"resume 会话 {sid}，恢复 {len(msgs)} 条消息")
+        self.loop._file_hashes = new_session.read_file_hashes()  # 乐观锁状态随会话恢复
+        name = new_session.get_name()
+        suffix = f"（{name}）" if name else ""
+        print(f"resume 会话 {sid}{suffix}，恢复 {len(msgs)} 条消息")
         self._render_todos()
 
     def _render_todos(self) -> None:
@@ -177,10 +194,63 @@ class REPL:
 
         return TraceStore(self.loop.session.trace_path).timeline_view()
 
+    def _rename(self, name: str) -> None:
+        """重命名当前会话（display name，写 meta.json）。sid 目录名不变。"""
+        self.loop.session.set_name(name)
+        print(f"[rename] 会话 {self.loop.session.sid} 命名为: {name}")
+
+    def _undo(self) -> None:
+        """回滚最近一次 Write/Edit（三线：文件 + todo + messages）。"""
+        msg = self.loop.session.undo_last_write()
+        self._sync_after_rollback()
+        print(msg)
+
+    async def _rewind(self, cmd: str) -> None:
+        """回退到某条用户消息处理完成后的状态（用户消息粒度）。"""
+        parts = cmd.split(maxsplit=1)
+        targets = self.loop.session.list_rewind_targets()
+        if not targets:
+            print("(没有可回退的用户消息)")
+            return
+        # /rewind <n>：n 是第几条用户消息（1-based，对应下面列表的编号）
+        if len(parts) >= 2 and parts[1].strip().isdigit():
+            n = int(parts[1].strip())
+            if not (1 <= n <= len(targets)):
+                print(f"(编号需在 1~{len(targets)} 之间)")
+                return
+            self._do_rewind(targets[n - 1], n)
+            return
+        # 不带参数：交互列出选项
+        print("可回退到的用户消息（回退到最后一条 = 无变化）：")
+        for i, t in enumerate(targets, 1):
+            print(f"  {i}. {t['preview']}")
+        try:
+            ans = await self._session.prompt_async("选择 (1-N，回车取消): ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        ans = ans.strip()
+        if ans.isdigit() and 1 <= int(ans) <= len(targets):
+            self._do_rewind(targets[int(ans) - 1], int(ans))
+        else:
+            print("已取消")
+
+    def _do_rewind(self, target: dict, n: int) -> None:
+        msg = self.loop.session.rewind_to_user(target["idx"])
+        self._sync_after_rollback()
+        print(f"[rewind] 回到第 {n} 条消息：{msg}")
+
+    def _sync_after_rollback(self) -> None:
+        """回滚后同步内存态：loop.messages 重读、todo_store 重载。"""
+        self.loop.messages = self.loop.session.read_messages()
+        if self.loop.todo_store is not None:
+            self.loop.todo_store.load()
+        self._render_todos()
+
     async def _switch_model(self, cmd: str) -> None:
         """热切换供应商：换 loop.provider（归一化历史可重序列化）。"""
         from .config import Config
-        from .provider import OpenAICompatibleProvider
+        from .provider import AnthropicProvider, OpenAICompatibleProvider
 
         parts = cmd.split(maxsplit=1)
         alias = parts[1].strip() if len(parts) > 1 else None
@@ -193,9 +263,14 @@ class REPL:
         if not m or not key:
             print(f"unknown model or missing api_key: {alias}")
             return
-        new_provider = OpenAICompatibleProvider(
-            base_url=m.base_url, api_key=key, model=m.model, context_window=m.context_window
-        )
+        if m.provider == "anthropic":
+            new_provider = AnthropicProvider(
+                api_key=key, model=m.model, context_window=m.context_window, max_tokens=m.max_tokens
+            )
+        else:
+            new_provider = OpenAICompatibleProvider(
+                base_url=m.base_url, api_key=key, model=m.model, context_window=m.context_window
+            )
         self.loop.provider = new_provider
         if self.loop.compactor:
             self.loop.compactor.provider = new_provider
