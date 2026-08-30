@@ -239,6 +239,270 @@ class OpenAICompatibleProvider:
         )
 
 
+def _map_stop_reason(stop_reason: str | None) -> str | None:
+    """Anthropic stop_reason → OpenAI 风格 finish_reason。"""
+    if stop_reason == "end_turn":
+        return "stop"
+    if stop_reason == "tool_use":
+        return "tool_calls"
+    if stop_reason == "max_tokens":
+        return "length"
+    return stop_reason
+
+
+def to_anthropic_tools(tools: list[dict] | None) -> list[dict]:
+    """OpenAI tool defs → Anthropic tools 格式。input_schema.type 兜底 "object"。"""
+    out: list[dict] = []
+    for t in tools or []:
+        fn = t.get("function", {})
+        schema = dict(fn.get("parameters") or {"type": "object"})
+        schema.setdefault("type", "object")
+        out.append(
+            {
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "input_schema": schema,
+            }
+        )
+    return out
+
+
+def _merge_adjacent(out: list[dict]) -> list[dict]:
+    """合并连续同角色消息（Anthropic 强制 user/assistant 交替）。tool 已在 to_ 阶段合并。"""
+    merged: list[dict] = []
+    for msg in out:
+        if merged and merged[-1]["role"] == msg["role"]:
+            prev = merged[-1]
+            pc, mc = prev["content"], msg["content"]
+            if isinstance(pc, list) and isinstance(mc, list):
+                prev["content"] = pc + mc
+            elif isinstance(pc, list):
+                prev["content"] = pc + [{"type": "text", "text": mc}]
+            elif isinstance(mc, list):
+                prev["content"] = [{"type": "text", "text": pc}] + mc
+            else:
+                prev["content"] = pc + "\n" + mc
+        else:
+            merged.append(msg)
+    return merged
+
+
+def to_anthropic_messages(
+    messages: list[Message], system: str | None = None
+) -> tuple[str | None, list[dict]]:
+    """归一化 list[Message] → Anthropic 格式 (system, messages)。
+
+    - tool 消息（可能连续多条）→ 合并成一条 user 的 tool_result blocks
+    - assistant.tool_calls → content 里的 tool_use blocks（input 是 dict，不 json 序列化）
+    - system role 消息 → 合并进 system 字段
+    """
+    out: list[dict] = []
+    i, n = 0, len(messages)
+    while i < n:
+        m = messages[i]
+        if m.role == "system":
+            system = (system + "\n" + (m.content or "")) if system else (m.content or "")
+            i += 1
+        elif m.role == "tool":
+            blocks: list[dict] = []
+            while i < n and messages[i].role == "tool":
+                t = messages[i]
+                blocks.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": t.tool_call_id or "",
+                        "content": t.content or "",
+                    }
+                )
+                i += 1
+            out.append({"role": "user", "content": blocks})
+        elif m.role == "user":
+            out.append({"role": "user", "content": m.content or ""})
+            i += 1
+        elif m.role == "assistant":
+            blocks = []
+            if m.content:
+                blocks.append({"type": "text", "text": m.content})
+            for tc in m.tool_calls or []:
+                blocks.append(
+                    {
+                        "type": "tool_use",
+                        "id": tc.id or "",
+                        "name": tc.name,
+                        "input": tc.arguments or {},
+                    }
+                )
+            out.append({"role": "assistant", "content": blocks if blocks else (m.content or "")})
+            i += 1
+        else:
+            i += 1
+    return system, _merge_adjacent(out)
+
+
+def from_anthropic_response(resp: Any) -> NormalizedResponse:
+    """Anthropic 响应 → 归一化。resp 可为 anthropic SDK 对象或 dict（fixture）。
+
+    content 是 list[ContentBlock]：text block 拼 content，tool_use block 转 ToolCall
+    （input 本来就是 dict）。usage 拆 input/output tokens。stop_reason 映射 finish_reason。
+    """
+    if hasattr(resp, "model_dump"):
+        data = resp.model_dump()
+    elif isinstance(resp, dict):
+        data = resp
+    else:
+        raise TypeError(f"unsupported response type: {type(resp)}")
+
+    text_parts: list[str] = []
+    tool_calls: list[ToolCall] = []
+    for block in data.get("content") or []:
+        if isinstance(block, str):
+            text_parts.append(block)
+        elif block.get("type") == "text":
+            text_parts.append(block.get("text") or "")
+        elif block.get("type") == "tool_use":
+            tool_calls.append(
+                ToolCall(
+                    id=block.get("id", ""),
+                    name=block.get("name", ""),
+                    arguments=block.get("input") or {},
+                )
+            )
+    usage_data = data.get("usage") or {}
+    in_tok = usage_data.get("input_tokens", 0)
+    out_tok = usage_data.get("output_tokens", 0)
+    return NormalizedResponse(
+        content="".join(text_parts) or None,
+        tool_calls=tool_calls or None,
+        usage=Usage(in_tok, out_tok, in_tok + out_tok),
+        finish_reason=_map_stop_reason(data.get("stop_reason")),
+        model=data.get("model"),
+        raw=data,
+    )
+
+
+class AnthropicProvider:
+    """Anthropic Messages API provider。双向翻译 + chat/stream。
+
+    延迟导入 anthropic（__init__），无依赖时不报错（测试用 fixture 不打真实 API）。
+    max_tokens 必传（Anthropic 强制）。
+    """
+
+    def __init__(self, api_key: str, model: str, context_window: int, max_tokens: int = 8192):
+        self._model = model
+        self._context_window = context_window
+        self._max_tokens = max_tokens
+        from anthropic import AsyncAnthropic  # 延迟导入
+
+        self._client = AsyncAnthropic(api_key=api_key)
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    @property
+    def context_window(self) -> int:
+        return self._context_window
+
+    def _kwargs(self, messages, tools, system) -> dict[str, Any]:
+        system_out, msgs = to_anthropic_messages(messages, system)
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "max_tokens": self._max_tokens,
+            "messages": msgs,
+        }
+        if system_out:
+            kwargs["system"] = system_out
+        if tools:
+            kwargs["tools"] = to_anthropic_tools(tools)
+        return kwargs
+
+    async def chat(
+        self,
+        messages: list[Message],
+        tools: list[dict] | None = None,
+        system: str | None = None,
+        **kw,
+    ) -> NormalizedResponse:
+        resp = await self._client.messages.create(**self._kwargs(messages, tools, system))
+        return from_anthropic_response(resp)
+
+    async def stream(
+        self,
+        messages: list[Message],
+        tools: list[dict] | None = None,
+        system: str | None = None,
+        on_delta: Callable[[str], None] | None = None,
+        on_reasoning: Callable[[str], None] | None = None,
+        **kw,
+    ) -> NormalizedResponse:
+        """流式：按 index 累积 text / tool_use 片段。
+
+        坑：input_tokens 在 message_start 事件，output_tokens 在 message_delta 事件；
+        tool_use 的 input 是 partial_json 按 index 累积，流结束 json.loads 重建。
+        """
+        text_parts: list[str] = []
+        tool_by_index: dict[int, dict] = {}
+        finish_reason: str | None = None
+        input_tokens = output_tokens = 0
+        async with self._client.messages.stream(
+            **self._kwargs(messages, tools, system)
+        ) as stream:
+            async for event in stream:
+                if event.type == "message_start":
+                    if event.message and event.message.usage:
+                        input_tokens = event.message.usage.input_tokens
+                elif event.type == "content_block_start":
+                    cb = event.content_block
+                    if getattr(cb, "type", None) == "tool_use":
+                        tool_by_index[event.index] = {
+                            "id": cb.id,
+                            "name": cb.name,
+                            "input_parts": [],
+                        }
+                elif event.type == "content_block_delta":
+                    delta = event.delta
+                    if getattr(delta, "type", None) == "text_delta" and delta.text:
+                        text_parts.append(delta.text)
+                        if on_delta:
+                            on_delta(delta.text)
+                    elif (
+                        getattr(delta, "type", None) == "input_json_delta"
+                        and delta.partial_json
+                    ):
+                        tool_by_index.setdefault(
+                            event.index, {"id": None, "name": None, "input_parts": []}
+                        )["input_parts"].append(delta.partial_json)
+                    elif getattr(delta, "type", None) == "thinking_delta" and on_reasoning:
+                        on_reasoning(delta.thinking)
+                elif event.type == "message_delta":
+                    if event.delta and event.delta.stop_reason:
+                        finish_reason = event.delta.stop_reason
+                    if event.usage:
+                        output_tokens = event.usage.output_tokens
+
+        content = "".join(text_parts) or None
+        tool_calls: list[ToolCall] | None = None
+        if tool_by_index:
+            tool_calls = []
+            for idx in sorted(tool_by_index):
+                rec = tool_by_index[idx]
+                args_str = "".join(rec["input_parts"])
+                try:
+                    args = json.loads(args_str) if args_str else {}
+                except json.JSONDecodeError:
+                    args = {"_raw": args_str}
+                tool_calls.append(
+                    ToolCall(id=rec["id"] or "", name=rec["name"] or "", arguments=args)
+                )
+        return NormalizedResponse(
+            content=content,
+            tool_calls=tool_calls,
+            usage=Usage(input_tokens, output_tokens, input_tokens + output_tokens),
+            finish_reason=_map_stop_reason(finish_reason),
+            model=self._model,
+        )
+
+
 class ScriptExhaustedError(Exception):
     """FakeProvider 剧本耗尽。"""
 

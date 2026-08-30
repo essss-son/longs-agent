@@ -19,7 +19,9 @@ class ModelConfig:
     base_url: str
     model: str
     context_window: int
-    api_key_env: str = ""       # 从此环境变量读 api_key
+    api_key: str = ""           # 直接在 config.toml 写明文（优先）
+    api_key_env: str = ""       # 或从此环境变量读 api_key（fallback）
+    max_tokens: int = 8192      # Anthropic 必传；OpenAI-compatible 忽略
 
 
 @dataclass
@@ -27,6 +29,7 @@ class McpServerConfig:
     name: str
     command: str
     args: list[str] = field(default_factory=list)
+    url: str = ""               # 非空走 streamable HTTP（云端）；空走 stdio（本地）
 
 
 @dataclass
@@ -43,9 +46,13 @@ class Config:
 
     def api_key(self, alias: str | None = None) -> str | None:
         m = self.get(alias)
-        if not m or not m.api_key_env:
+        if not m:
             return None
-        return os.environ.get(m.api_key_env)
+        if m.api_key:            # toml 明文优先
+            return m.api_key
+        if m.api_key_env:        # 否则 fallback 环境变量
+            return os.environ.get(m.api_key_env)
+        return None
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "Config":
@@ -66,6 +73,7 @@ class Config:
                             name=mname,
                             command=sub.get("command", ""),
                             args=list(sub.get("args", [])),
+                            url=sub.get("url", ""),
                         )
                 continue
             alias = tbl.get("alias", table_name)
@@ -75,7 +83,9 @@ class Config:
                 base_url=tbl.get("base_url", ""),
                 model=tbl.get("model", ""),
                 context_window=int(tbl.get("context_window", 32768)),
+                api_key=tbl.get("api_key", ""),
                 api_key_env=tbl.get("api_key_env", ""),
+                max_tokens=int(tbl.get("max_tokens", 8192)),
             )
             if not default_alias:
                 default_alias = alias
