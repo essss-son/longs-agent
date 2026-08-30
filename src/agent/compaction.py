@@ -1,11 +1,11 @@
-"""Compaction（D9+D10：三策略 + 配对边界 + token 检查 + 滞回）。
+"""Compaction（D9+D10：两策略 + 配对边界 + token 检查 + 滞回）。
 
 触发：used > 0.8 * (context_window - output_reserve)（effective，预留输出 token；工具 schema
 token 必须算入，最常被遗忘 → 阈值偏小、触发滞后）。
 配对边界不拆：find_pair_units 把 assistant(tool_calls)+其后匹配的 tool 消息当一个 unit，
 整体保留或整体处理——避免拆配对导致 tool_call_id 悬空。
-三策略（换出而非丢弃：原始内容先进 archive.jsonl，context 留 mem_id 指针，MemoryRead 可取回）：
-- ToolResultElision：老 tool 消息归档后换「首尾 + mem_id 指针」（保留结构，配对天然不破）
+工具结果的超长截断已由 envelope（dispatch 阶段）统一承担，这里只做历史 unit 级压缩。
+两策略（换出而非丢弃：原始内容先进 archive.jsonl，context 留 mem_id 指针，MemoryRead 可取回）：
 - LLMSummary：旧 unit 调 provider 摘要，替换为单条 user "[summary: ...]"（边界对齐 unit）
 - SlidingWindow：system + 最近 N units（边界对齐）
 滞回：compact 后 _just_compacted=True，跳过下一次 should_compact 检查（让消息增长一轮），
@@ -83,59 +83,6 @@ class CompactionStrategy(ABC):
     async def compact(self, messages: list[Message]) -> list[Message]:
         ...
 
-
-class ToolResultElision(CompactionStrategy):
-    """老 tool 消息内容换出：原文归档 L2，context 留「首尾 + mem_id 指针」marker。
-
-    写/执行类工具（Edit/Write/Bash）的结果短且关键（成功/失败信息），不掏空；
-    读类工具（Read/Glob/Grep）的结果可能很长，归档后截断保留首尾，模型仍可感知大致内容，
-    需要完整原文时按 marker 里的 mem_id 调 MemoryRead 取回——压缩从"丢弃"变"换出"。
-    """
-
-    # 结果短且关键、不掏空的工具
-    PROTECTED_TOOLS = {"Edit", "Write", "Bash"}
-    # 读类工具结果截断时保留的首尾字符数
-    ELIDE_MARGIN = 50
-
-    def __init__(self, keep_recent: int = 4, archive=None):
-        self.keep_recent = keep_recent  # 保留最近 N 条 tool 消息不 elide
-        self.archive = archive  # ArchiveStore | None：None 时退化为纯截断（无指针）
-
-    def _elide_content(self, m: Message) -> str:
-        """写类工具结果完整保留；读类工具结果归档 + 保留首尾各 ELIDE_MARGIN 字符。"""
-        name, content = m.name, m.content or ""
-        if name in self.PROTECTED_TOOLS:
-            return content
-        if len(content) <= self.ELIDE_MARGIN * 2:
-            return content
-        marker = f"[elided {len(content)} chars"
-        if self.archive is not None:
-            mem_id = self.archive.archive(
-                content, kind="elision", tool_name=name or "", tool_call_id=m.tool_call_id or ""
-            )
-            marker += f' | mem_id={mem_id} | 用 MemoryRead("{mem_id}") 恢复'
-        marker += "]"
-        head = content[: self.ELIDE_MARGIN]
-        tail = content[-self.ELIDE_MARGIN:]
-        return f"{head}\n... {marker} ...\n{tail}"
-
-    async def compact(self, messages: list[Message]) -> list[Message]:
-        tool_indices = [i for i, m in enumerate(messages) if m.role == "tool"]
-        if len(tool_indices) <= self.keep_recent:
-            return messages
-        to_elide = set(tool_indices[: len(tool_indices) - self.keep_recent])
-        out = []
-        for i, m in enumerate(messages):
-            if i in to_elide:
-                content = self._elide_content(m)
-                out.append(
-                    Message("tool", content=content, tool_call_id=m.tool_call_id, name=m.name)
-                )
-            else:
-                out.append(m)
-        return out
-
-
 class LLMSummary(CompactionStrategy):
     """旧 unit 归档后调 provider 摘要，替换为单条 user "[summary]"。边界对齐 unit（不拆配对）。
 
@@ -143,10 +90,11 @@ class LLMSummary(CompactionStrategy):
     （文件路径/函数名/错误码/ID 原样保留——这些是后续检索的锚，最易被摘要吞掉）。
     """
 
-    def __init__(self, provider, keep_recent_units: int = 4, archive=None):
+    def __init__(self, provider, keep_recent_units: int = 4, archive=None, usage_sink=None):
         self.provider = provider
         self.keep_recent_units = keep_recent_units
         self.archive = archive
+        self.usage_sink = usage_sink  # 回调：摘要请求结束后上报 usage，补 /cost 缺口
 
     async def compact(self, messages: list[Message]) -> list[Message]:
         units = find_pair_units(messages)
@@ -166,7 +114,30 @@ class LLMSummary(CompactionStrategy):
         summary_prompt = [
             Message(
                 "system",
-                "Concisely summarize the conversation, preserving key facts and decisions.\n"
+                "Summarize the conversation into the following FIVE sections, keeping this EXACT structure:\n"
+                "\n"
+                "## 📌 Archived Session Summary\n"
+                "*(Contains context from [Start Time] to [Cutoff Time])*\n"
+                "\n"
+                "### 🎯 Objectives & Status\n"
+                "* **Original Goal**: [what the user originally wanted to do]\n"
+                "\n"
+                "### 🏗️ Technical Context (Static)\n"
+                "* **Stack**: [language, framework, versions]\n"
+                "* **Environment**: [OS, shell, key env vars]\n"
+                "\n"
+                "### ✅ Completed Milestones (The \"Done\" Pile)\n"
+                "* [✓] [completed task] - [brief result]\n"
+                "\n"
+                "### 🧠 Key Insights & Decisions (Persistent Memory)\n"
+                "* **Decisions**: [key technical choices or abandoned approaches]\n"
+                "* **Learnings**: [special configs, API formats, gotchas]\n"
+                "* **User Preferences**: [habits the user emphasized]\n"
+                "\n"
+                "### 📂 File System State (Snapshot)\n"
+                "*(Modified files in this archive segment)*\n"
+                "* `path/to/file`: what changed.\n"
+                "\n"
                 "CRITICAL — preserve these identifiers VERBATIM (do not translate, paraphrase, "
                 "or abbreviate): file paths (e.g. src/agent/loop.py), function/class names "
                 "(find_pair_units), error codes/messages, IDs and numbers (t_0007, 110 passed), URLs.\n"
@@ -178,6 +149,8 @@ class LLMSummary(CompactionStrategy):
         try:
             resp = await self.provider.chat(summary_prompt, tools=None)
             summary = resp.content or "(empty summary)"
+            if self.usage_sink is not None:
+                self.usage_sink(resp.usage)  # 摘要请求的 token 也要进 /cost
         except Exception as e:
             summary = f"(summary failed: {e})"
         marker = "[summary of earlier turns]"
@@ -247,12 +220,29 @@ class Compactor:
         self.context_window = context_window
         self.output_reserve = output_reserve
         self.archive = archive  # ArchiveStore | None：压缩换出的内容归档处
+        self._summary_prompt = 0  # 压缩期 LLMSummary 摘要请求累计的 token（补 /cost 缺口）
+        self._summary_completion = 0
         self.strategies = strategies or [
-            ToolResultElision(archive=archive),
-            LLMSummary(provider, archive=archive),
+            LLMSummary(provider, archive=archive, usage_sink=self._add_summary_usage),
             SlidingWindow(archive=archive),
         ]
         self._just_compacted = False  # 滞回
+
+    def _add_summary_usage(self, usage) -> None:
+        """LLMSummary 摘要请求结束后回调：累加 token。"""
+        self._summary_prompt += usage.prompt_tokens
+        self._summary_completion += usage.completion_tokens
+
+    def consume_summary_usage(self) -> dict:
+        """返回并清零压缩期累计的摘要 token（loop 写 trace 用）。"""
+        d = {
+            "prompt_tokens": self._summary_prompt,
+            "completion_tokens": self._summary_completion,
+            "total_tokens": self._summary_prompt + self._summary_completion,
+        }
+        self._summary_prompt = 0
+        self._summary_completion = 0
+        return d
 
     def reset(self) -> None:
         """重置滞回标记：新一轮对话开始时重新允许压缩。"""
