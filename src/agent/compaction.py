@@ -1,22 +1,54 @@
-"""Compaction（D9+D10：两策略 + 配对边界 + token 检查 + 滞回）。
+"""Compaction（D9+D10：单策略滚动摘要 + 工具调用台账）。
 
-触发：used > 0.8 * (context_window - output_reserve)（effective，预留输出 token；工具 schema
-token 必须算入，最常被遗忘 → 阈值偏小、触发滞后）。
-配对边界不拆：find_pair_units 把 assistant(tool_calls)+其后匹配的 tool 消息当一个 unit，
-整体保留或整体处理——避免拆配对导致 tool_call_id 悬空。
-工具结果的超长截断已由 envelope（dispatch 阶段）统一承担，这里只做历史 unit 级压缩。
-两策略（换出而非丢弃：原始内容先进 archive.jsonl，context 留 mem_id 指针，MemoryRead 可取回）：
-- LLMSummary：旧 unit 调 provider 摘要，替换为单条 user "[summary: ...]"（边界对齐 unit）
-- SlidingWindow：system + 最近 N units（边界对齐）
-滞回：compact 后 _just_compacted=True，跳过下一次 should_compact 检查（让消息增长一轮），
-之后自动解除恢复正常判断——避免"压缩一次后永久失效"（否则长对话 context 会撑爆）。
+触发：used > 0.8 * (context_window - output_reserve)（effective）。
+配对边界不拆：find_pair_units 把 assistant(tool_calls)+其后匹配的 tool 消息当一个 unit。
+换出而非丢弃：每个换出的 tool 输出发一个 t_XXXX（信封大输出已有指针则透传，其余内联
+全文），context 里留「滚动摘要 + 早期工具调用台账」——台账是程序生成的 name+args→mem_id
+映射，模型据此用 MemoryRead 按需取回原文。非工具内容只进滚动摘要，不单独归档。
+滞回：compact 后 _just_compacted=True，跳过下一次 should_compact，让消息增长一轮。
 """
 from __future__ import annotations
 
+import json
+import re
 from abc import ABC, abstractmethod
 
 from .messages import Message
 from .utils import estimate_messages_tokens
+
+MEM_ID_RE = re.compile(r"mem_id=(t_\w+)")
+
+SUMMARY_TEMPLATE = (
+    "Summarize the conversation into the following FIVE sections, keeping this EXACT structure:\n"
+    "\n"
+    "## 📌 Archived Session Summary\n"
+    "*(Contains context from [Start Time] to [Cutoff Time])*\n"
+    "\n"
+    "### 🎯 Objectives & Status\n"
+    "* **Original Goal**: [what the user originally wanted to do]\n"
+    "\n"
+    "### 🏗️ Technical Context (Static)\n"
+    "* **Stack**: [language, framework, versions]\n"
+    "* **Environment**: [OS, shell, key env vars]\n"
+    "\n"
+    "### ✅ Completed Milestones (The \"Done\" Pile)\n"
+    "* [✓] [completed task] - [brief result]\n"
+    "\n"
+    "### 🧠 Key Insights & Decisions (Persistent Memory)\n"
+    "* **Decisions**: [key technical choices or abandoned approaches]\n"
+    "* **Learnings**: [special configs, API formats, gotchas]\n"
+    "* **User Preferences**: [habits the user emphasized]\n"
+    "\n"
+    "### 📂 File System State (Snapshot)\n"
+    "*(Modified files in this archive segment)*\n"
+    "* `path/to/file`: what changed.\n"
+    "\n"
+    "CRITICAL — preserve these identifiers VERBATIM (do not translate, paraphrase, "
+    "or abbreviate): file paths (e.g. src/agent/loop.py), function/class names "
+    "(find_pair_units), error codes/messages, IDs and numbers (t_0007, 110 passed), URLs.\n"
+    "These are retrieval anchors: rewording 'src/agent/loop.py' as 'a file' makes it "
+    "unsearchable later. Prefer verbose-but-exact over concise-but-vague."
+)
 
 
 def find_pair_units(messages: list[Message]) -> list[tuple[int, int]]:
