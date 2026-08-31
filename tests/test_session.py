@@ -219,3 +219,49 @@ def test_undo_truncates_messages_to_assistant_index(tmp_path):
     msgs = s.read_messages()
     assert len(msgs) == 1
     assert msgs[0].content == "hi"
+
+
+def test_rewind_to_user_without_writes_truncates_messages(tmp_path):
+    """rewind 到无写操作的用户消息：只截断 messages，不碰文件。"""
+    s = SessionStore(root=str(tmp_path))
+    for m in [
+        Message("user", "消息1"),
+        Message("assistant", "回复1"),
+        Message("user", "消息2"),
+        Message("assistant", "回复2"),
+        Message("user", "消息3"),
+        Message("assistant", "回复3"),
+    ]:
+        s.append_message(m)
+    s.rewind_to_user(0)  # 回退到消息1，撤销消息2、3（均无写）
+    msgs = s.read_messages()
+    assert len(msgs) == 2  # 只剩消息1 + 回复1
+    assert msgs[-1].content == "回复1"
+
+
+def test_undo_deletes_consumed_snapshot(tmp_path):
+    """undo 后删除已消费快照文件 + index 记录。"""
+    s = SessionStore(root=str(tmp_path))
+    f = tmp_path / "f.txt"
+    f.write_text("v0\n", encoding="utf-8")
+    s.save_file_snapshot(seq=10, file_path=str(f), assistant_index=1)
+    f.write_text("v1\n", encoding="utf-8")
+    s.undo_last_write()
+    assert f.read_text() == "v0\n"
+    assert s.list_file_snapshots() == []  # index 清空
+    leftovers = [p.name for p in s.snapshot_dir.iterdir() if p.name != "index.json"]
+    assert leftovers == []  # 文件副本被删
+
+
+def test_rewind_deletes_consumed_snapshots_keeps_earlier(tmp_path):
+    """rewind 只删 user_index > target 的快照，target 自身的快照保留。"""
+    s = SessionStore(root=str(tmp_path))
+    f = tmp_path / "f.txt"
+    f.write_text("v0\n", encoding="utf-8")
+    s.save_file_snapshot(seq=10, file_path=str(f), assistant_index=1, user_index=0)
+    f.write_text("v1\n", encoding="utf-8")
+    s.save_file_snapshot(seq=20, file_path=str(f), assistant_index=5, user_index=4)
+    f.write_text("v2\n", encoding="utf-8")
+    s.rewind_to_user(0)  # 撤销 user_index > 0 的写（seq=20）
+    assert f.read_text() == "v1\n"
+    assert [snap["seq"] for snap in s.list_file_snapshots()] == [10]
