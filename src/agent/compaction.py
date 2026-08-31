@@ -75,39 +75,44 @@ def find_pair_units(messages: list[Message]) -> list[tuple[int, int]]:
     return units
 
 
-def _serialize_for_summary(messages: list[Message]) -> str:
+def _compact_args(args: dict) -> str:
+    """args 序列化为紧凑字符串，统一截断 120 字符（超长加 …）。"""
+    if not args:
+        return ""
+    s = " ".join(json.dumps(args, ensure_ascii=False).split())
+    return s[:120] + ("…" if len(s) > 120 else "")
+
+
+def _extract_mem_id(content: str) -> str | None:
+    """从信封头部抽出 t_XXXX（信封消息才有；普通 tool 消息无）。"""
+    m = MEM_ID_RE.search(content or "")
+    return m.group(1) if m else None
+
+
+def _ledger_block(entries: list[tuple[str, str, str, str]], limit: int) -> str:
+    """台账块：程序生成的 name+args → mem_id 映射，截断到最近 limit 条。"""
+    if not entries:
+        return ""
+    lines = ["## 早期工具调用台账"]
+    for _, mem_id, name, args in entries[-limit:]:
+        lines.append(f"- {mem_id} | {name}  {args}")
+    return "\n".join(lines)
+
+
+def _serialize_unit(unit_msgs: list[Message], mem_by_tc: dict[str, str]) -> str:
+    """序列化一个 unit 喂摘要：tool 输出不贴正文，占位 [输出见 t_XXXX]。"""
     parts: list[str] = []
-    for m in messages:
+    for m in unit_msgs:
         content = m.content or ""
         if m.role == "assistant" and m.tool_calls:
             tcs = ", ".join(f"{tc.name}({tc.arguments})" for tc in m.tool_calls)
             parts.append(f"assistant: {content} [called: {tcs}]")
         elif m.role == "tool":
-            parts.append(f"tool({m.name}): {content[:200]}")
+            mem_id = mem_by_tc.get(m.tool_call_id) or _extract_mem_id(content)
+            parts.append(f"tool({m.name}): [输出见 {mem_id}]" if mem_id else f"tool({m.name}): {content[:200]}")
         else:
             parts.append(f"{m.role}: {content}")
     return "\n".join(parts)
-
-
-def _ensure_tool_archived(archive, unit_messages: list[Message]) -> None:
-    """换出 unit 前补归档：对 unit 里每条 tool 消息，若全文未归档则补一份 kind=elision。
-
-    堵「错位带」丢失——elision 保留窗（按 tool 条数）与 summary/window 保留窗（按 unit 数）
-    不重合时，某条长 tool 可能落在 elision 保留区（未归档全文）却落在 summary 换出区，
-    被序列化时 content[:200] 截断、超出部分无全文副本。本函数在换出前兜底补全文。
-    用 tool_call_id 防重复：已归档的跳过。
-    """
-    for m in unit_messages:
-        if m.role != "tool":
-            continue
-        if archive.has_tool_call_id(m.tool_call_id or ""):
-            continue
-        archive.archive(
-            m.content or "",
-            kind="elision",
-            tool_name=m.name or "",
-            tool_call_id=m.tool_call_id or "",
-        )
 
 
 class CompactionStrategy(ABC):
@@ -115,68 +120,88 @@ class CompactionStrategy(ABC):
     async def compact(self, messages: list[Message]) -> list[Message]:
         ...
 
-class LLMSummary(CompactionStrategy):
-    """旧 unit 归档后调 provider 摘要，替换为单条 user "[summary]"。边界对齐 unit（不拆配对）。
 
-    摘要是"目录"不是"内容"：原始 units 先进 archive，摘要只保留关键事实 + 标识符锚点
-    （文件路径/函数名/错误码/ID 原样保留——这些是后续检索的锚，最易被摘要吞掉）。
+class RollingSummary(CompactionStrategy):
+    """旧 unit 归档为 t_ + 滚动摘要 + 台账（单策略，原 LLMSummary/SlidingWindow 已合并）。
+
+    每个换出的 tool 输出发一个 t_（信封大输出透传已有 mem_id，其余内联全文）；非工具
+    内容只喂摘要，不归档。摘要输入是旧 unit 序列化文本（tool 占位），输出替换旧的单条
+    summary。台账由程序生成拼在摘要后。
     """
 
-    def __init__(self, provider, keep_recent_units: int = 4, archive=None, usage_sink=None):
+    def __init__(self, provider, keep_recent_units: int = 4, archive=None, usage_sink=None, ledger_limit: int = 40):
         self.provider = provider
         self.keep_recent_units = keep_recent_units
         self.archive = archive
         self.usage_sink = usage_sink  # 回调：摘要请求结束后上报 usage，补 /cost 缺口
+        self.ledger_limit = ledger_limit
 
     async def compact(self, messages: list[Message]) -> list[Message]:
         units = find_pair_units(messages)
         if len(units) <= self.keep_recent_units:
             return messages
         recent_start = units[-self.keep_recent_units][0]
-        old_msgs = messages[:recent_start]
         recent_msgs = messages[recent_start:]
-        if not old_msgs:
+        if not messages[:recent_start]:
             return messages
-        # 原始 units 先归档（档案是 source of truth，摘要是目录）
+
+        ledger: list[tuple[str, str, str, str]] = []
+        mem_by_tc: dict[str, str] = {}
+        serialized_parts: list[str] = []
+        for s, e in units[: -self.keep_recent_units]:
+            unit_msgs = messages[s : e + 1]
+            entries = self._elide_unit(unit_msgs)
+            ledger.extend(entries)
+            for tc_id, mem_id, _, _ in entries:
+                mem_by_tc[tc_id] = mem_id
+            serialized_parts.append(_serialize_unit(unit_msgs, mem_by_tc))
+
+        summary = await self._summarize("\n".join(serialized_parts))
+
+        marker = "[summary of earlier turns]"
         if self.archive is not None:
-            for s, e in units[: -self.keep_recent_units]:
-                unit_msgs = messages[s : e + 1]
-                _ensure_tool_archived(self.archive, unit_msgs)  # 换出前补 tool 全文
-                self.archive.archive(_serialize_for_summary(unit_msgs), kind="summary")
+            marker += "（原始内容已归档：用 MemoryRead 按 mem_id 取回）"
+        body = f"{marker}\n{summary}"
+        ledger_text = _ledger_block(ledger, self.ledger_limit)
+        if ledger_text:
+            body += "\n\n" + ledger_text
+        summary_msg = Message("user", body)
+        # 若第一条 recent 也是 user，合并避免连续同角色（Claude API 拒绝）
+        if recent_msgs and recent_msgs[0].role == "user":
+            recent_msgs[0].content = summary_msg.content + "\n" + (recent_msgs[0].content or "")
+            return recent_msgs
+        return [summary_msg] + recent_msgs
+
+    def _elide_unit(self, unit_msgs: list[Message]) -> list[tuple[str, str, str, str]]:
+        """为 unit 里每个 tool 输出发 t_，返回台账条目 [(tool_call_id, mem_id, name, args)]。
+
+        信封透传：content 带 mem_id=t_ 的不重复归档，直接登记；其余内联全文归档。
+        """
+        entries: list[tuple[str, str, str, str]] = []
+        assistant = next((m for m in unit_msgs if m.role == "assistant" and m.tool_calls), None)
+        if assistant is None:
+            return entries
+        tool_by_id = {m.tool_call_id: m for m in unit_msgs if m.role == "tool"}
+        for tc in assistant.tool_calls:
+            tmsg = tool_by_id.get(tc.id)
+            if tmsg is None:
+                continue
+            mem_id = _extract_mem_id(tmsg.content or "")
+            if mem_id is None and self.archive is not None and not self.archive.has_tool_call_id(tc.id):
+                mem_id = self.archive.archive(
+                    tmsg.content or "",
+                    kind="tool",
+                    tool_name=tmsg.name or "",
+                    tool_call_id=tc.id,
+                )
+            if mem_id:
+                entries.append((tc.id, mem_id, tc.name, _compact_args(tc.arguments)))
+        return entries
+
+    async def _summarize(self, serialized_old: str) -> str:
         summary_prompt = [
-            Message(
-                "system",
-                "Summarize the conversation into the following FIVE sections, keeping this EXACT structure:\n"
-                "\n"
-                "## 📌 Archived Session Summary\n"
-                "*(Contains context from [Start Time] to [Cutoff Time])*\n"
-                "\n"
-                "### 🎯 Objectives & Status\n"
-                "* **Original Goal**: [what the user originally wanted to do]\n"
-                "\n"
-                "### 🏗️ Technical Context (Static)\n"
-                "* **Stack**: [language, framework, versions]\n"
-                "* **Environment**: [OS, shell, key env vars]\n"
-                "\n"
-                "### ✅ Completed Milestones (The \"Done\" Pile)\n"
-                "* [✓] [completed task] - [brief result]\n"
-                "\n"
-                "### 🧠 Key Insights & Decisions (Persistent Memory)\n"
-                "* **Decisions**: [key technical choices or abandoned approaches]\n"
-                "* **Learnings**: [special configs, API formats, gotchas]\n"
-                "* **User Preferences**: [habits the user emphasized]\n"
-                "\n"
-                "### 📂 File System State (Snapshot)\n"
-                "*(Modified files in this archive segment)*\n"
-                "* `path/to/file`: what changed.\n"
-                "\n"
-                "CRITICAL — preserve these identifiers VERBATIM (do not translate, paraphrase, "
-                "or abbreviate): file paths (e.g. src/agent/loop.py), function/class names "
-                "(find_pair_units), error codes/messages, IDs and numbers (t_0007, 110 passed), URLs.\n"
-                "These are retrieval anchors: rewording 'src/agent/loop.py' as 'a file' makes it "
-                "unsearchable later. Prefer verbose-but-exact over concise-but-vague.",
-            ),
-            Message("user", _serialize_for_summary(old_msgs)),
+            Message("system", SUMMARY_TEMPLATE),
+            Message("user", serialized_old),
         ]
         try:
             resp = await self.provider.chat(summary_prompt, tools=None)
@@ -185,56 +210,7 @@ class LLMSummary(CompactionStrategy):
                 self.usage_sink(resp.usage)  # 摘要请求的 token 也要进 /cost
         except Exception as e:
             summary = f"(summary failed: {e})"
-        marker = "[summary of earlier turns]"
-        if self.archive is not None:
-            marker += "（原始内容已归档：MemorySearch 检索 / MemoryRead 取回）"
-        summary_msg = Message("user", f"{marker}\n{summary}")
-        # 若第一条 recent 也是 user，合并避免连续同角色（Claude API 拒绝）
-        if recent_msgs and recent_msgs[0].role == "user":
-            recent_msgs[0].content = summary_msg.content + "\n" + (recent_msgs[0].content or "")
-            return recent_msgs
-        return [summary_msg] + recent_msgs
-
-
-class SlidingWindow(CompactionStrategy):
-    """system + 最近 N units（边界对齐 unit）。换出的旧 unit 按 unit 归档，留指针消息。"""
-
-    def __init__(self, keep_recent_units: int = 6, archive=None):
-        self.keep_recent_units = keep_recent_units
-        self.archive = archive
-
-    async def compact(self, messages: list[Message]) -> list[Message]:
-        units = find_pair_units(messages)
-        if len(units) <= self.keep_recent_units:
-            return messages
-        old_units = units[: -self.keep_recent_units]
-        # 换出的旧 unit（非 system）按 unit 归档：检索回来必是完整 call+result 配对
-        if self.archive is not None:
-            swapped = 0
-            for s, e in old_units:
-                if messages[s].role != "system":
-                    unit_msgs = messages[s : e + 1]
-                    _ensure_tool_archived(self.archive, unit_msgs)  # 换出前补 tool 全文
-                    self.archive.archive(
-                        _serialize_for_summary(unit_msgs), kind="window"
-                    )
-                    swapped += e - s + 1
-        out = [m for m in messages if m.role == "system"]
-        if self.archive is not None and swapped:
-            out.append(
-                Message(
-                    "user",
-                    f"[{swapped} 条早期消息已换出到会话档案 | 用 MemorySearch 检索 / MemoryRead 取回]",
-                )
-            )
-        recent_start = units[-self.keep_recent_units][0]
-        recent = messages[recent_start:]
-        # 若指针消息与第一条 recent 都是 user，合并避免连续同角色（Claude API 拒绝）
-        if recent and recent[0].role == "user" and out and out[-1].role == "user":
-            recent[0].content = (out[-1].content or "") + "\n" + (recent[0].content or "")
-            out.pop()
-        out.extend(recent)
-        return out
+        return summary
 
 
 class Compactor:
@@ -252,16 +228,15 @@ class Compactor:
         self.context_window = context_window
         self.output_reserve = output_reserve
         self.archive = archive  # ArchiveStore | None：压缩换出的内容归档处
-        self._summary_prompt = 0  # 压缩期 LLMSummary 摘要请求累计的 token（补 /cost 缺口）
+        self._summary_prompt = 0  # 压缩期 RollingSummary 摘要请求累计的 token（补 /cost 缺口）
         self._summary_completion = 0
         self.strategies = strategies or [
-            LLMSummary(provider, archive=archive, usage_sink=self._add_summary_usage),
-            SlidingWindow(archive=archive),
+            RollingSummary(provider, archive=archive, usage_sink=self._add_summary_usage),
         ]
         self._just_compacted = False  # 滞回
 
     def _add_summary_usage(self, usage) -> None:
-        """LLMSummary 摘要请求结束后回调：累加 token。"""
+        """RollingSummary 摘要请求结束后回调：累加 token。"""
         self._summary_prompt += usage.prompt_tokens
         self._summary_completion += usage.completion_tokens
 
