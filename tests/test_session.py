@@ -113,6 +113,20 @@ def test_resume_loads_history(tmp_path):
     assert msgs[1].content == "reply"
 
 
+def test_resume_restores_seq_continuation(tmp_path):
+    """resume 后 _seq 续号：新事件 seq 不与历史 seq 冲突。"""
+    s1 = SessionStore(root=str(tmp_path))
+    s1.append_trace({"type": "a"})
+    s1.append_trace({"type": "b"})
+    sid = s1.sid
+    assert s1.read_trace()[-1]["seq"] == 2
+
+    s2 = SessionStore(root=str(tmp_path), sid=sid)
+    new_seq = s2.append_trace({"type": "c"})
+    assert new_seq == 3  # 续号，不重新从 1 开始
+    assert [e["seq"] for e in s2.read_trace()] == [1, 2, 3]
+
+
 def test_list_sessions(tmp_path):
     SessionStore(root=str(tmp_path), sid="aaa11111")
     SessionStore(root=str(tmp_path), sid="bbb22222")
