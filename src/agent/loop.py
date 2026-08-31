@@ -33,6 +33,7 @@ class AgentLoop:
         repl=None,
         todo_store=None,
         compactor=None,
+        archive=None,
         system_prompt: str | None = None,
         max_steps: int = 20,
         loop_detection_threshold: int = 3,
@@ -46,6 +47,7 @@ class AgentLoop:
         self.repl = repl
         self.todo_store = todo_store
         self.compactor = compactor
+        self.archive = archive
         self.system_prompt = system_prompt
         self.max_steps = max_steps  # 单轮最大 LLM 调用次数，超了优雅退出
         self.loop_detection_threshold = loop_detection_threshold  # 连续 N 次相同工具调用触发循环检测
@@ -417,11 +419,13 @@ class AgentLoop:
         # 乐观锁：Read 成功后记录文件 hash；Write/Edit 成功后更新为新内容 hash
         if tc.name in ("Read", "Write", "Edit") and not result.startswith("[error"):
             self._record_file_hash(tc.arguments.get("file_path", ""))
-        # 统一信封：超阈值 → 截断 + 落盘 tool-output/ + 返回指针
+        # 统一信封：超阈值 → 截断 + 落盘 session/tool-output/ + 返回指针
         result = wrap_tool_result(
             result,
             tool_name=tc.name,
             direction=tc.arguments.get("truncation", "head"),
+            output_dir=str(self.session.dir / "tool-output"),
+            archive=self.archive,
         )
         self.session.append_trace(
             {"type": "tool_result", "data": {"content_preview": result[:200]}}
