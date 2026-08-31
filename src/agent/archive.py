@@ -1,29 +1,22 @@
-"""L2 档案层：压缩换出的原始内容落盘，模型按需取回（swap-out 架构）。
+"""L2 档案层：压缩换出的工具原文落盘，模型按 mem_id 取回。
 
-context 从"唯一记忆"降级为"缓存层"：Elision 掏空 / Summary 摘要 / Window 滑出前，
-原始内容先进本层，context 里只留带 mem_id 的指针 marker，模型用 MemoryRead 取回。
+单策略压缩下，archive 只存「工具输出」：信封截断的大输出落盘 tool-output/ 文件、
+记录只存 file_path 指针；中等/小输出内联全文。检索入口只有 MemoryRead（按 mem_id
+一次取回原文），不再有全文检索——"该读哪条"由 context 里的「早期工具调用台账」
+给出，模型自己挑 mem_id 读。
 
 存储：session 目录下 archive.jsonl，append-only + 容错读（复用 session.read_jsonl_tolerant）。
-记录：{mem_id, kind, tool_name, tool_call_id, seq, char_count, preview, content}
-- kind: elision（掏空）/ summary（摘要前归档）/ window（滑出，chunk 对齐 pair unit）
-- seq: 会话内单调序号（档案是历史快照，时序冲突时据此判断新旧）
+记录：{mem_id, kind, tool_name, tool_call_id, seq, char_count, preview, content, file_path?}
+- mem_id: t_XXXX，全局单调编号，resume 读档续号
+- file_path: 信封大输出的原文文件；有则 MemoryRead 读文件，否则读内联 content
 """
 from __future__ import annotations
 
 import json
-import math
-import re
 from pathlib import Path
 
 from .session import read_jsonl_tolerant
 from .tools import Tool
-
-_TOKEN_RE = re.compile(r"[a-z0-9_./:-]+|[一-鿿]")
-
-
-def _tokenize(text: str) -> list[str]:
-    """英文/标识符按词，中文按单字（零依赖 lite 分词，兼顾代码标识符与中文）。"""
-    return _TOKEN_RE.findall(text.lower())
 
 
 class ArchiveStore:
@@ -35,9 +28,16 @@ class ArchiveStore:
         self._records: list[dict] = read_jsonl_tolerant(self.path)
 
     def archive(
-        self, content: str, *, kind: str, tool_name: str = "", tool_call_id: str = ""
+        self,
+        content: str,
+        *,
+        kind: str = "tool",
+        tool_name: str = "",
+        tool_call_id: str = "",
+        file_path: str = "",
+        char_count: int | None = None,
     ) -> str:
-        """归档一段内容，返回 mem_id。"""
+        """归档一段内容，返回 mem_id。file_path 指向信封大输出的原文文件（原文不内联）。"""
         mem_id = f"t_{len(self._records) + 1:04d}"
         record = {
             "mem_id": mem_id,
@@ -45,10 +45,12 @@ class ArchiveStore:
             "tool_name": tool_name,
             "tool_call_id": tool_call_id,
             "seq": len(self._records) + 1,
-            "char_count": len(content),
+            "char_count": len(content) if char_count is None else char_count,
             "preview": " ".join(content.split())[:80],
             "content": content,
         }
+        if file_path:
+            record["file_path"] = file_path
         line = json.dumps(record, ensure_ascii=False)
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
