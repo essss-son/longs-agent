@@ -8,9 +8,10 @@ dist/
 .venv/
 venv/
 
-# Runtime data: sessions / skills / traces (per-user, never tracked)
+# Runtime data: sessions / skills / traces / tool-output (per-user, never tracked)
 .agent/sessions/
 .agent/skills/
+tool-output/
 
 # Local config: keep example tracked, ignore real (may hold base_url)
 .agent/config.toml
