@@ -65,63 +65,22 @@ class ArchiveStore:
         return None
 
     def has_tool_call_id(self, tool_call_id: str) -> bool:
-        """这条 tool 的全文是否已归档（kind=elision 且 tool_call_id 匹配）。
-
-        用于 summary/window 换出 unit 前补归档：避免对已有全文副本的 tool 重复归档。
-        """
+        """这条 tool 的原文是否已归档（kind=tool 且 tool_call_id 匹配），防重复归档。"""
         if not tool_call_id:
             return False
         return any(
-            r["kind"] == "elision" and r["tool_call_id"] == tool_call_id
+            r["kind"] == "tool" and r["tool_call_id"] == tool_call_id
             for r in self._records
         )
 
-    def search(self, query: str, k: int = 5) -> list[tuple[dict, float]]:
-        """BM25 检索 + recency 加权，返回 [(record, score)] top-k。"""
-        q_tokens = _tokenize(query)
-        if not q_tokens:
-            return []
-        docs = [(_tokenize(r["content"]), r) for r in self._records]
-        n = len(docs)
-        if n == 0:
-            return []
-        # df: 每个词出现在多少条档案
-        df: dict[str, int] = {}
-        for tokens, _ in docs:
-            for t in set(tokens):
-                df[t] = df.get(t, 0) + 1
-        avgdl = sum(len(tokens) for tokens, _ in docs) / n  # 平均文档长度
-        k1, b = 1.5, 0.75  # BM25 超参：词频饱和 + 长度归一化
-        scored: list[tuple[dict, float]] = []
-        for tokens, r in docs:
-            tf: dict[str, int] = {}
-            for t in tokens:
-                tf[t] = tf.get(t, 0) + 1
-            doc_len = len(tokens)
-            score = 0.0
-            for qt in q_tokens:
-                if qt not in tf:
-                    continue
-                f = tf[qt]
-                # BM25 IDF：平滑、恒正，df 越大 idf 越小
-                idf = math.log(1 + (n - df[qt] + 0.5) / (df[qt] + 0.5))
-                # 词频饱和 + 文档长度归一化
-                score += idf * (f * (k1 + 1)) / (f + k1 * (1 - b + b * doc_len / avgdl))
-            if score > 0:
-                score *= 1 + 0.1 * (r["seq"] / n)  # recency：新的略优先
-                scored.append((r, score))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored[:k]
-
 
 class MemoryRead(Tool):
-    """按 mem_id 取回档案原文。read_only（plan 模式可用）。"""
+    """按 mem_id 取回工具原文。read_only（plan 模式可用）。"""
 
     name = "MemoryRead"
     description = (
-        "按 mem_id 从会话档案取回被压缩换出的原始内容。"
-        "当历史消息中出现 [elided ... mem_id=t_xxxx] marker、"
-        "或需要找回早前工具输出/消息的完整内容时使用。"
+        "按 mem_id 从会话档案取回被压缩换出的工具输出原文。"
+        "mem_id 从 context 里的「早期工具调用台账」读取；需要找回早前某次工具调用的完整输出时使用。"
     )
     schema = {
         "type": "object",
@@ -145,46 +104,15 @@ class MemoryRead(Tool):
         r = self.store.read(mem_id)
         if r is None:
             return f"[error: no archive entry '{mem_id}']"
+        content = r.get("content") or ""
+        fp = r.get("file_path")
+        if fp and Path(fp).exists():
+            content = Path(fp).read_text(encoding="utf-8")
+        char_count = r.get("char_count") or len(content)
         header = (
-            f"[archive {r['mem_id']} | kind={r['kind']} | tool={r['tool_name'] or '-'} "
-            f"| seq={r['seq']} | {r['char_count']} chars | 历史快照]\n"
+            f"[archive {r['mem_id']} | tool={r['tool_name'] or '-'} "
+            f"| seq={r['seq']} | {char_count} chars | 历史快照]\n"
         )
-        content = r["content"]
         if len(content) > max_chars:
             content = content[:max_chars] + f"\n... [truncated at {max_chars} chars]"
         return header + content
-
-
-class MemorySearch(Tool):
-    """关键词检索档案，返回 top-k 候选（mem_id + preview）。read_only（plan 可用）。"""
-
-    name = "MemorySearch"
-    description = (
-        "在会话档案中检索被压缩换出的历史内容（早期工具输出/消息），返回候选 mem_id + 预览。"
-        "需要找回早前出现过的路径/函数名/报错/数字、或用户提到「刚才/之前」时使用；"
-        "拿到 mem_id 后用 MemoryRead 取回原文。"
-    )
-    schema = {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "检索关键词（路径/函数名/报错片段等）"},
-            "k": {"type": "integer", "default": 5, "description": "返回候选数"},
-        },
-        "required": ["query"],
-        "additionalProperties": False,
-    }
-    read_only = True
-
-    def __init__(self, store: ArchiveStore):
-        self.store = store
-
-    async def execute(self, query: str, k: int = 5, **_: object) -> str:
-        hits = self.store.search(query, k=k)
-        if not hits:
-            return "(no matches)"
-        lines = [
-            f'{r["mem_id"]} | {r["kind"]}/{r["tool_name"] or "-"} | seq={r["seq"]} '
-            f"| {r['char_count']} chars | {r['preview']}"
-            for r, _ in hits
-        ]
-        return "\n".join(lines)
