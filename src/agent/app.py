@@ -8,7 +8,7 @@ import os
 from contextlib import AsyncExitStack
 from datetime import datetime
 
-from .archive import ArchiveStore, MemoryRead, MemorySearch
+from .archive import ArchiveStore, MemoryRead
 from .builtin_tools import Bash, Edit, Glob, Grep, Read, Write
 from .compaction import Compactor
 from .config import Config
@@ -125,7 +125,6 @@ async def main() -> None:
         todo_store = TodoStore(path=session.todo_path)
         registry.register(TodoWrite(todo_store))
         registry.register(MemoryRead(archive))
-        registry.register(MemorySearch(archive))
         registry.register(Task(provider, light_provider=light_provider))
         context_window = model.context_window if model else 32768
         compactor = Compactor(provider, context_window=context_window, archive=archive)
@@ -148,6 +147,7 @@ async def main() -> None:
             mode=Mode.MANUAL,
             todo_store=todo_store,
             compactor=compactor,
+            archive=archive,
             system_prompt=system_prompt,
         )
         repl = REPL(loop)
