@@ -107,7 +107,12 @@ class MemoryRead(Tool):
         content = r.get("content") or ""
         fp = r.get("file_path")
         if fp and Path(fp).exists():
-            content = Path(fp).read_text(encoding="utf-8")
+            raw = Path(fp).read_text(encoding="utf-8")
+            try:  # 信封落盘是 JSON 包装（{"tool":..., "content":...}），解包取原文
+                loaded = json.loads(raw)
+                content = loaded.get("content", raw) if isinstance(loaded, dict) else raw
+            except json.JSONDecodeError:
+                content = raw  # 非 JSON 文件：原样返回
         char_count = r.get("char_count") or len(content)
         header = (
             f"[archive {r['mem_id']} | tool={r['tool_name'] or '-'} "
