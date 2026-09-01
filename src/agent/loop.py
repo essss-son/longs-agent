@@ -152,7 +152,11 @@ class AgentLoop:
             tools = self._active_tools()
             # 请求前压缩：超 80% effective 则 compact（配对不破）
             if self.compactor and self.compactor.should_compact(self.messages, tools):
+                before_len = len(self.messages)
                 self.messages = await self.compactor.compact(self.messages, tools)
+                if len(self.messages) < before_len:
+                    # 真压了：磁盘与内存对齐，resume 读回压缩后状态
+                    self.session.rewrite_messages(self.messages)
                 self.session.append_trace(
                     {
                         "type": "compaction",
