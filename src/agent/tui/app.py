@@ -465,6 +465,8 @@ class TUIApp:
                 self.loop.messages = await self.loop.compactor.compact(
                     self.loop.messages, self.loop._active_tools()
                 )
+                if len(self.loop.messages) < before:
+                    self.loop.session.rewrite_messages(self.loop.messages)  # 磁盘与内存对齐
                 self._append_raw(f"\n[compacted] {before} → {len(self.loop.messages)} 条\n")
             return
         if c == "/cost":
