@@ -275,6 +275,19 @@ class SessionStore:
                 f.write(json.dumps(d, ensure_ascii=False) + "\n")
         os.replace(tmp, self.messages_path)
 
+    def rewrite_messages(self, msgs: list[Message]) -> None:
+        """用内存 msgs 全量重写 messages.jsonl（原子写）。
+
+        压缩后调用：磁盘与内存对齐，resume 读回的就是压缩后状态，
+        不再回到全量未压缩历史。
+        """
+        tmp = self.messages_path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            for m in msgs:
+                f.write(json.dumps(m.to_dict(), ensure_ascii=False) + "\n")
+            f.flush()
+        os.replace(tmp, self.messages_path)
+
     def undo_last_write(self) -> str:
         """回滚最近一次写操作：文件 + todo + messages 三线回到写之前。"""
         idx = self.list_file_snapshots()
