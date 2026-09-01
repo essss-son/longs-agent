@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 
 from agent.messages import Message
+from agent.compaction import SUMMARY_MARKER
 from agent.session import SessionStore
 
 
@@ -265,3 +266,38 @@ def test_rewind_deletes_consumed_snapshots_keeps_earlier(tmp_path):
     s.rewind_to_user(0)  # 撤销 user_index > 0 的写（seq=20）
     assert f.read_text() == "v1\n"
     assert [snap["seq"] for snap in s.list_file_snapshots()] == [10]
+
+
+def test_rewrite_messages_roundtrip(tmp_path):
+    """rewrite_messages 全量重写后回读一致。"""
+    s = SessionStore(root=str(tmp_path))
+    msgs = [Message("user", "q"), Message("assistant", "a")]
+    for m in msgs:
+        s.append_message(m)
+    s.append_message(Message("user", "extra"))  # 多余的旧行
+    s.rewrite_messages(msgs)
+    assert s.read_messages() == msgs  # extra 被覆盖掉
+
+
+async def test_rewrite_messages_resume_after_compaction(tmp_path):
+    """压缩后 rewrite：新 SessionStore（resume）读回的是压缩后列表，不是全量历史。"""
+    from agent.compaction import RollingSummary
+    from agent.provider import FakeProvider
+    from agent.messages import NormalizedResponse
+
+    s = SessionStore(root=str(tmp_path))
+    msgs = [
+        Message("user", "old1"), Message("assistant", "old1 reply"),
+        Message("user", "old2"), Message("assistant", "old2 reply"),
+        Message("user", "recent"), Message("assistant", "recent reply"),
+    ]
+    for m in msgs:
+        s.append_message(m)
+    rs = RollingSummary(FakeProvider([NormalizedResponse(content="rolled summary")]), keep_recent_units=2)
+    compacted = await rs.compact(msgs)
+    assert len(compacted) < len(msgs)
+    s.rewrite_messages(compacted)
+    # resume：新 store 读同一目录
+    s2 = SessionStore(root=str(tmp_path), sid=s.sid)
+    assert s2.read_messages() == compacted
+    assert SUMMARY_MARKER in s2.read_messages()[0].content
