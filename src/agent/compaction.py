@@ -5,6 +5,7 @@
 换出而非丢弃：每个换出的 tool 输出发一个 t_XXXX（信封大输出已有指针则透传，其余内联
 全文），context 里留「滚动摘要 + 早期工具调用台账」——台账是程序生成的 name+args→mem_id
 映射，模型据此用 MemoryRead 按需取回原文。非工具内容只进滚动摘要，不单独归档。
+台账跨压缩续传：旧摘要消息里的台账块由程序解析回条目滚动保留（不让 LLM 抄写结构化映射）。
 滞回：compact 后 _just_compacted=True，跳过下一次 should_compact，让消息增长一轮。
 """
 from __future__ import annotations
@@ -17,6 +18,9 @@ from .messages import Message
 from .utils import estimate_messages_tokens
 
 MEM_ID_RE = re.compile(r"mem_id=(t_\w+)")
+SUMMARY_MARKER = "[summary of earlier turns]"
+LEDGER_HEADER = "## 早期工具调用台账"
+LEDGER_LINE_RE = re.compile(r"^- (t_\d+) \| (\S+)\s+(.*)$")
 
 SUMMARY_TEMPLATE = (
     "Summarize the conversation into the following FIVE sections, keeping this EXACT structure:\n"
@@ -93,10 +97,40 @@ def _ledger_block(entries: list[tuple[str, str, str, str]], limit: int) -> str:
     """台账块：程序生成的 name+args → mem_id 映射，截断到最近 limit 条。"""
     if not entries:
         return ""
-    lines = ["## 早期工具调用台账"]
+    lines = [LEDGER_HEADER]
     for _, mem_id, name, args in entries[-limit:]:
         lines.append(f"- {mem_id} | {name}  {args}")
     return "\n".join(lines)
+
+
+def _split_old_summary(content: str) -> tuple[str, list[tuple[str, str, str, str]]]:
+    """拆旧摘要消息：返回 (摘要文本, 台账条目)。
+
+    台账块由 _ledger_block 程序生成、逐行格式确定，可解析回条目续传——LLM 只见摘要
+    文本，永远不接触台账（不让模型抄写 mem_id 映射）。台账块之后若还有文本（上一轮
+    合并进来的 user 内容），保留在摘要文本里继续喂 LLM。
+    """
+    idx = content.find(LEDGER_HEADER)
+    if idx < 0:
+        return content, []
+    head = content[:idx].rstrip()
+    lines = content[idx + len(LEDGER_HEADER):].splitlines()
+    entries: list[tuple[str, str, str, str]] = []
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
+        if not s:
+            i += 1
+            continue  # header 自身的换行 / 台账行间空行
+        m = LEDGER_LINE_RE.match(s)
+        if m is None:
+            break  # 台账行结束，后面是合并进来的 user 内容
+        entries.append(("", m.group(1), m.group(2), m.group(3)))
+        i += 1
+    tail = "\n".join(lines[i:]).strip()
+    if tail:
+        head = f"{head}\n{tail}" if head else tail
+    return head, entries
 
 
 def _serialize_unit(unit_msgs: list[Message], mem_by_tc: dict[str, str]) -> str:
@@ -150,15 +184,29 @@ class RollingSummary(CompactionStrategy):
         serialized_parts: list[str] = []
         for s, e in units[: -self.keep_recent_units]:
             unit_msgs = messages[s : e + 1]
+            # 旧摘要消息：台账条目解析出来续传，摘要文本（去台账块）照常喂 LLM 滚动合并
+            if unit_msgs[0].role == "user" and SUMMARY_MARKER in (unit_msgs[0].content or ""):
+                body, old_entries = _split_old_summary(unit_msgs[0].content or "")
+                ledger.extend(old_entries)
+                serialized_parts.append(f"user: {body}")
+                continue
             entries = self._elide_unit(unit_msgs)
             ledger.extend(entries)
             for tc_id, mem_id, _, _ in entries:
                 mem_by_tc[tc_id] = mem_id
             serialized_parts.append(_serialize_unit(unit_msgs, mem_by_tc))
+        # 按 mem_id 去重（resume 双重压缩时，信封透传可能与旧台账撞同一 mem_id）
+        seen: set[str] = set()
+        unique: list[tuple[str, str, str, str]] = []
+        for en in ledger:
+            if en[1] not in seen:
+                seen.add(en[1])
+                unique.append(en)
+        ledger = unique
 
         summary = await self._summarize("\n".join(serialized_parts))
 
-        marker = "[summary of earlier turns]"
+        marker = SUMMARY_MARKER
         if self.archive is not None:
             marker += "（原始内容已归档：用 MemoryRead 按 mem_id 取回）"
         body = f"{marker}\n{summary}"
