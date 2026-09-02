@@ -29,6 +29,7 @@ longs-agent项目说明.md
 
 # All markdown docs (internal, not for remote)
 *.md
+!README.md
 
 # SWE-bench evaluation (code, logs, results) — not for remote
 .agent/swebench*
