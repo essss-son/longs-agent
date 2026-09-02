@@ -423,14 +423,17 @@ class AgentLoop:
         # 乐观锁：Read 成功后记录文件 hash；Write/Edit 成功后更新为新内容 hash
         if tc.name in ("Read", "Write", "Edit") and not result.startswith("[error"):
             self._record_file_hash(tc.arguments.get("file_path", ""))
-        # 统一信封：超阈值 → 截断 + 落盘 session/tool-output/ + 返回指针
-        result = wrap_tool_result(
-            result,
-            tool_name=tc.name,
-            direction=tc.arguments.get("truncation", "head"),
-            output_dir=str(self.session.dir / "tool-output"),
-            archive=self.archive,
-        )
+        # 统一信封：超阈值 → 截断 + 落盘 session/tool-output/ + 返回指针。
+        # MemoryRead 豁免：自带 max_chars 护栏，且取回的原文已在档（有 mem_id），
+        # 再截断落盘会造成同一段原文两个码，破坏"一级寻址"。
+        if tc.name != "MemoryRead":
+            result = wrap_tool_result(
+                result,
+                tool_name=tc.name,
+                direction=tc.arguments.get("truncation", "head"),
+                output_dir=str(self.session.dir / "tool-output"),
+                archive=self.archive,
+            )
         self.session.append_trace(
             {"type": "tool_result", "data": {"content_preview": result[:200]}}
         )
