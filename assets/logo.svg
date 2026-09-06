@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="160" viewBox="0 0 640 160" role="img" aria-label="longs-agent">
+  <defs>
+    <linearGradient id="brand" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9B00FF"/>
+      <stop offset="1" stop-color="#0064FF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 圆角方形标记 -->
+  <rect x="8" y="8" width="144" height="144" rx="34" fill="url(#brand)"/>
+
+  <!-- 终端提示符 > _ -->
+  <g fill="none" stroke="#ffffff" stroke-width="14" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M60 52 L40 80 L60 108"/>
+  </g>
+  <rect x="70" y="100" width="46" height="12" rx="6" fill="#ffffff"/>
+
+  <!-- 字标 -->
+  <text x="180" y="101" font-family="system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif" font-size="60" font-weight="700">
+    <tspan fill="#0F172A">longs</tspan><tspan fill="url(#brand)">-agent</tspan>
+  </text>
+</svg>
