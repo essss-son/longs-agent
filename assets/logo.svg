@@ -1,25 +1,21 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="740" height="160" viewBox="0 0 740 160" role="img" aria-label="longs-agent">
+<svg xmlns="http://www.w3.org/2000/svg" width="924" height="168" viewBox="0 0 924 168" role="img" aria-label="longs-agent">
   <defs>
     <linearGradient id="brand" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#9B00FF"/>
       <stop offset="1" stop-color="#0064FF"/>
     </linearGradient>
   </defs>
-
-  <!-- 圆角方形标记 -->
-  <rect x="8" y="8" width="144" height="144" rx="34" fill="url(#brand)"/>
+  <rect x="8" y="12" width="144" height="144" rx="34" fill="url(#brand)"/>
   <g fill="none" stroke="#ffffff" stroke-width="14" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M60 52 L40 80 L60 108"/>
+    <path d="M60 56 L40 84 L60 112"/>
   </g>
-  <rect x="70" y="100" width="46" height="12" rx="6" fill="#ffffff"/>
-
-  <!-- figlet slant 字标，逐行紫→蓝渐变 -->
-  <text font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="14" xml:space="preserve">
-    <tspan x="176" y="40" fill="#9B00FF">__                                                    __</tspan>
-    <tspan x="176" y="58" fill="#7C14FF">   / /___  ____  ____ ______      ____ _____ ____  ____  / /_</tspan>
-    <tspan x="176" y="76" fill="#5D28FF">  / / __ \/ __ \/ __ `/ ___/_____/ __ `/ __ `/ _ \/ __ \/ __/</tspan>
-    <tspan x="176" y="94" fill="#3E3CFF"> / / /_/ / / / / /_/ (__  )_____/ /_/ / /_/ /  __/ / / / /_</tspan>
-    <tspan x="176" y="112" fill="#1F50FF">/_/\____/_/ /_/\__, /____/      \__,_/\__, /\___/_/ /_/\__/</tspan>
-    <tspan x="176" y="130" fill="#0064FF">              /____/                 /____/</tspan>
+  <rect x="70" y="104" width="46" height="12" rx="6" fill="#ffffff"/>
+  <text font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" font-size="20" xml:space="preserve">
+    <tspan x="176" y="32" fill="#9B00FF">    __                                                    __</tspan>
+    <tspan x="176" y="56" fill="#7C14FF">   / /___  ____  ____ ______      ____ _____ ____  ____  / /_</tspan>
+    <tspan x="176" y="80" fill="#5D28FF">  / / __ \/ __ \/ __ `/ ___/_____/ __ `/ __ `/ _ \/ __ \/ __/</tspan>
+    <tspan x="176" y="104" fill="#3E3CFF"> / / /_/ / / / / /_/ (__  )_____/ /_/ / /_/ /  __/ / / / /_</tspan>
+    <tspan x="176" y="128" fill="#1F50FF">/_/\____/_/ /_/\__, /____/      \__,_/\__, /\___/_/ /_/\__/</tspan>
+    <tspan x="176" y="152" fill="#0064FF">              /____/                 /____/</tspan>
   </text>
 </svg>

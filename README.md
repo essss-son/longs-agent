@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="longs-agent" width="520" />
+  <img src="assets/logo.svg" alt="longs-agent" width="680" />
 </p>
 
 一个 Claude Code 风格的 async code agent CLI，自研实现核心能力并做有意识取舍裁剪。
