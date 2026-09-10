@@ -77,13 +77,22 @@ def test_normal_default_ask_for_write_tool():
     assert v == Verdict.ASK
 
 
-def test_manual_asks_read_tool():
-    """manual 模式下读工具也要确认。"""
+def test_manual_allows_read_tool():
+    """manual 模式下只读工具（Read）走 allow 规则免审批。"""
     eng = PermissionEngine()
     cfg = PermissionConfig()
     tc = ToolCall(id="x", name="Read", arguments={"file_path": "/tmp/x"})
     v, _ = eng.check(tc, cfg, Mode.MANUAL)
-    assert v == Verdict.ASK
+    assert v == Verdict.ALLOW
+
+
+def test_manual_allows_skill_tool():
+    """Skill 工具只读，manual 模式免审批。"""
+    eng = PermissionEngine()
+    cfg = PermissionConfig()
+    tc = ToolCall(id="x", name="Skill", arguments={"name": "project-guide"})
+    v, _ = eng.check(tc, cfg, Mode.MANUAL)
+    assert v == Verdict.ALLOW
 
 
 def test_always_grants_overrides_default_ask():

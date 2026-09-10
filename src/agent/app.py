@@ -19,6 +19,7 @@ from .plan_mode import EnterPlanMode, ExitPlanMode
 from .provider import AnthropicProvider, FakeProvider, OpenAICompatibleProvider
 from .repl import REPL
 from .session import SessionStore
+from .skills import Skill
 from .task import Task
 from .todo import TodoStore, TodoWrite
 from .tools import ToolRegistry
@@ -32,6 +33,7 @@ def _build_registry() -> ToolRegistry:
     r.register(Bash())
     r.register(Glob())
     r.register(Grep())
+    r.register(Skill())
     r.register(EnterPlanMode())
     r.register(ExitPlanMode())
     return r

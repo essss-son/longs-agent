@@ -1,7 +1,10 @@
 """Skills 测试。"""
 from __future__ import annotations
 
-from agent.skills import Skill, _parse_frontmatter, scan_skills, skills_prompt_block
+import asyncio
+
+import agent.skills as skills_mod
+from agent.skills import Skill, SkillSpec, _parse_frontmatter, scan_skills, skills_prompt_block
 
 
 def test_parse_frontmatter(tmp_path):
@@ -40,7 +43,7 @@ def test_scan_skills_empty(tmp_path):
 
 
 def test_skills_prompt_block():
-    skills = [Skill("a", "desc a", "path/a"), Skill("b", "desc b", "path/b")]
+    skills = [SkillSpec("a", "desc a", "path/a"), SkillSpec("b", "desc b", "path/b")]
     block = skills_prompt_block(skills)
     assert "a" in block and "desc a" in block
     assert "b" in block
@@ -48,3 +51,21 @@ def test_skills_prompt_block():
 
 def test_skills_prompt_block_empty():
     assert skills_prompt_block([]) == ""
+
+
+def test_skill_tool_loads_body(tmp_path, monkeypatch):
+    d = tmp_path / "guide"
+    d.mkdir()
+    (d / "SKILL.md").write_text(
+        "---\nname: guide\ndescription: g\n---\nGUIDE BODY", encoding="utf-8"
+    )
+    monkeypatch.setattr(skills_mod, "scan_skills", lambda: scan_skills(str(tmp_path)))
+    out = asyncio.run(Skill().execute("guide"))
+    assert "GUIDE BODY" in out
+
+
+def test_skill_tool_not_found(tmp_path, monkeypatch):
+    monkeypatch.setattr(skills_mod, "scan_skills", lambda: scan_skills(str(tmp_path)))
+    out = asyncio.run(Skill().execute("nope"))
+    assert "not found" in out
+    assert "Available" in out

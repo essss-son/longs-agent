@@ -1,7 +1,7 @@
 """权限引擎：hard deny 不可覆盖 + 规则链 + 三模式。
 
 hard deny 清单短而致命（代码内置正则，任何模式/配置不可覆盖）。
-MANUAL: hard deny → deny → always → 默认 ASK（所有工具都问，读工具也问）。
+MANUAL: hard deny → deny → always → allow（只读工具免审批）→ 默认 ASK。
 AUTO:   hard deny → Write/Edit 项目目录外 ASK → 其余放行。
 PLAN:   注册表过滤（D7），dispatch 兜底校验 read_only。
 always 按 tool_name 粒度，会话内有效（存 meta.json，resume 同会话延续，新会话不继承）。
@@ -30,8 +30,7 @@ class Verdict(Enum):
 
 @dataclass
 class PermissionConfig:
-    # 只读工具默认 allow（不烦扰用户）；写工具默认 ASK
-    allow: list[str] = field(default_factory=lambda: ["Read", "Glob", "Grep"])
+    allow: list[str] = field(default_factory=lambda: ["Read", "Glob", "Grep", "Skill"])
     deny: list[str] = field(default_factory=list)
     always_grants: set[str] = field(default_factory=set)  # tool_name，会话内有效
     project_root: str = "."  # auto 模式项目目录边界（目录外写操作需确认）
@@ -87,11 +86,13 @@ class PermissionEngine:
             if tc.name in ("Write", "Edit", "Bash"):
                 return Verdict.DENY, "plan mode readonly"
             return Verdict.ALLOW, "plan mode readonly"
-        # MANUAL：所有工具都 ASK；always_grants 仍生效
+        # MANUAL：deny → always_grants → allow（只读工具免审批）→ 默认 ASK
         if tc.name in config.deny:
             return Verdict.DENY, "deny rule"
         if tc.name in config.always_grants:
             return Verdict.ALLOW, "always granted"
+        if tc.name in config.allow:
+            return Verdict.ALLOW, "allow rule"
         return Verdict.ASK, "manual mode ask"
 
     @staticmethod
